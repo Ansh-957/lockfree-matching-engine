@@ -1,0 +1,28 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# vcpkg
+vcpkg_installed/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results (generated, not checked in — documented in docs/benchmarks.md)
+results/*.json
+
+# Compiled
+*.o
+*.a
+*.so
+*.dylib
+*.exe
