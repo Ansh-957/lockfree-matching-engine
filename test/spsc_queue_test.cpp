@@ -1,6 +1,8 @@
-// spsc_queue_test.cpp — Unit tests for engine::SPSCQueue
-// Built from top-level CMakeLists.txt as part of the unit_tests target.
-// Fully implemented — SPSCQueue is complete.
+// Unit tests for engine::SPSCQueue
+//
+// Single-threaded correctness (FIFO, full/empty edges, wrap-around) plus a
+// two-thread stress test that pushes 1M items through the queue and checks
+// every one arrives exactly once, in order
 
 #include <gtest/gtest.h>
 #include "transport/spsc_queue.h"
@@ -9,28 +11,23 @@
 #include <thread>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 namespace {
-// SPSCQueue requires power-of-2 capacity. Usable slots = Capacity - 1
-// because one slot is reserved to distinguish full from empty.
-constexpr std::size_t kSmallCapacity = 16;       // 15 usable slots
-constexpr std::size_t kLargeCapacity = 1 << 20;  // 1 048 576 (1 048 575 usable)
+// usable slots = Capacity - 1 (one reserved to distinguish full from empty)
+constexpr std::size_t kSmallCapacity = 16;
+constexpr std::size_t kStressCapacity = 1024;  // small on purpose: forces wrap-arounds and full/empty collisions under contention
 } // namespace
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 TEST(SPSCQueueTest, PushAndPop) {
     engine::SPSCQueue<int, kSmallCapacity> q;
 
+    EXPECT_TRUE(q.empty());
     ASSERT_TRUE(q.try_push(42));
+    EXPECT_EQ(q.size(), 1u);
 
     int val = 0;
     ASSERT_TRUE(q.try_pop(val));
     EXPECT_EQ(val, 42);
+    EXPECT_TRUE(q.empty());
 }
 
 TEST(SPSCQueueTest, EmptyPopReturnsFalse) {
@@ -38,21 +35,25 @@ TEST(SPSCQueueTest, EmptyPopReturnsFalse) {
 
     int val = -1;
     EXPECT_FALSE(q.try_pop(val));
-    EXPECT_EQ(val, -1);  // val should be unchanged
+    EXPECT_EQ(val, -1);  // untouched on failure
 }
 
 TEST(SPSCQueueTest, FullPushReturnsFalse) {
     engine::SPSCQueue<int, kSmallCapacity> q;
 
-    // Fill every usable slot (Capacity - 1 slots usable)
     const std::size_t usable = kSmallCapacity - 1;
     for (std::size_t i = 0; i < usable; ++i) {
-        ASSERT_TRUE(q.try_push(static_cast<int>(i)))
-            << "try_push failed at index " << i;
+        ASSERT_TRUE(q.try_push(static_cast<int>(i))) << "push failed at " << i;
     }
 
-    // Next push must fail — queue is full
     EXPECT_FALSE(q.try_push(999));
+    EXPECT_EQ(q.size(), usable);
+
+    // popping one slot makes room for exactly one push
+    int val = 0;
+    ASSERT_TRUE(q.try_pop(val));
+    EXPECT_TRUE(q.try_push(999));
+    EXPECT_FALSE(q.try_push(1000));
 }
 
 TEST(SPSCQueueTest, FIFO) {
@@ -70,42 +71,61 @@ TEST(SPSCQueueTest, FIFO) {
     }
 }
 
-TEST(SPSCQueueTest, ConcurrentProducerConsumer) {
-    // Stress test: one producer thread pushes 1 M items,
-    // one consumer thread pops 1 M items. Verify all received in order.
+TEST(SPSCQueueTest, WrapAround) {
+    // cycle far more items than the capacity through a small queue so the
+    // indices wrap the ring many times
+    engine::SPSCQueue<int, kSmallCapacity> q;
 
-    constexpr std::size_t kItems = 1'000'000;
-    engine::SPSCQueue<std::uint64_t, kLargeCapacity> q;
+    int next_push = 0;
+    int next_pop  = 0;
+    for (int cycle = 0; cycle < 100; ++cycle) {
+        for (int i = 0; i < 10; ++i) {
+            ASSERT_TRUE(q.try_push(next_push++));
+        }
+        for (int i = 0; i < 10; ++i) {
+            int val = -1;
+            ASSERT_TRUE(q.try_pop(val));
+            ASSERT_EQ(val, next_pop++);
+        }
+    }
+    EXPECT_TRUE(q.empty());
+}
+
+TEST(SPSCQueueTest, ConcurrentProducerConsumer) {
+    // one producer, one consumer, 1M items through a deliberately small
+    // ring - constant wrap-around plus full/empty boundary hits is the
+    // hostile case for the memory-ordering logic
+    constexpr std::uint64_t kItems = 1'000'000;
+    engine::SPSCQueue<std::uint64_t, kStressCapacity> q;
 
     std::vector<std::uint64_t> received;
     received.reserve(kItems);
 
-    // --- Consumer thread ---
     std::thread consumer([&] {
         std::uint64_t val = 0;
-        for (std::size_t i = 0; i < kItems; /* no increment */) {
+        for (std::uint64_t i = 0; i < kItems;) {
             if (q.try_pop(val)) {
                 received.push_back(val);
                 ++i;
             }
-            // Busy-spin if nothing available — acceptable for testing.
+            // busy-spin when empty - fine for a test
         }
     });
 
-    // --- Producer thread (runs on the test thread) ---
-    for (std::uint64_t i = 0; i < kItems; /* no increment */) {
+    for (std::uint64_t i = 0; i < kItems;) {
         if (q.try_push(i)) {
             ++i;
         }
-        // Busy-retry if queue is full.
+        // busy-retry when full
     }
 
     consumer.join();
 
-    // Verify count and order
     ASSERT_EQ(received.size(), kItems);
-    for (std::size_t i = 0; i < kItems; ++i) {
-        EXPECT_EQ(received[i], static_cast<std::uint64_t>(i))
-            << "Order mismatch at index " << i;
+    for (std::uint64_t i = 0; i < kItems; ++i) {
+        if (received[i] != i) {
+            FAIL() << "order mismatch at index " << i << ": got " << received[i];
+        }
     }
+    EXPECT_TRUE(q.empty());
 }

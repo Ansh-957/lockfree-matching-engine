@@ -385,3 +385,125 @@ the cancel succeeds.
 - Each test constructs its own book, i.e. a fresh 240MB allocation per test.
   That's why the suite takes a few seconds — correctness tests prioritize
   isolation over speed; the benchmarks (Commit 7) reuse one book.
+
+---
+
+## Commit 5 — Lock-Free SPSC Ring Buffer (`spsc_queue.h`)
+
+### The problem it solves
+
+The engine has three threads (ingest → match → metrics) that must hand
+messages to each other. A mutex-protected queue means every handoff can block,
+and a blocked matching thread is a latency spike. The SPSC queue lets the two
+threads communicate with **no locks, no syscalls, no blocking** — just two
+atomic indices over a shared ring of slots.
+
+"SPSC" — *single* producer, *single* consumer — is the crucial restriction.
+With exactly one thread writing `head_` and exactly one writing `tail_`, there
+are no compare-and-swap loops, no contention, no ABA problem. The architecture
+(one queue per thread boundary) is what makes this simple queue sufficient.
+
+### How the ring works
+
+A fixed array of `Capacity` slots and two indices that wrap around:
+`head_` = where the producer writes next; `tail_` = where the consumer reads
+next. `head_ == tail_` means empty. Full is "head is one step behind tail",
+which is why **one slot always stays unused** — without that sacrifice, full
+and empty would both look like `head_ == tail_` and be indistinguishable.
+Usable capacity is therefore `Capacity - 1`.
+
+Capacity must be a power of two so that wrapping is `index & (Capacity - 1)`
+— a single AND instruction — instead of `index % Capacity`, an integer
+division costing ~20-40 cycles.
+
+### Memory ordering: why acquire/release, and what it means
+
+On modern CPUs (and compilers), memory operations can be reordered. Without
+constraints, the consumer could observe the new `head_` value *before* the
+item write that preceded it — and read garbage. C++ atomics let us forbid
+exactly the reorderings that would break us, and no more:
+
+- **`store(x, memory_order_release)`** — nothing written *before* this store
+  may be reordered *after* it. The producer writes the slot, *then* releases
+  the new head: "everything I did is visible once you see this index."
+- **`load(memory_order_acquire)`** — nothing *after* this load may be
+  reordered *before* it. When the consumer acquires `head_` and sees the new
+  value, the slot contents are guaranteed visible.
+- **`memory_order_relaxed`** — no ordering at all, just atomicity. Used when
+  a thread reads the index *only it ever writes* (the producer reading its
+  own `head_`): there's nothing to synchronize with yourself.
+
+The same handshake runs in reverse for `tail_`: the consumer releases the new
+tail only after it finished copying the item out, so the producer's acquire
+load of `tail_` proves the slot is safe to overwrite.
+
+Why not `memory_order_seq_cst` (the default)? It adds a full memory fence on
+x86 (`mfence`/locked instruction, dozens of cycles) to guarantee a *global*
+order across all atomics — a property this algorithm doesn't need. Why not a
+mutex? A mutex is a possible syscall and a possible context switch (micro-
+seconds); this handshake is a handful of nanoseconds.
+
+### False sharing and the cache-line padding
+
+CPU cores don't share individual bytes — they share 64-byte **cache lines**,
+and only one core can hold a line for writing at a time. If `head_` (written
+by the producer core) and `tail_` (written by the consumer core) sat in the
+same line, every push would yank the line away from the consumer's core and
+every pop would yank it back — "false sharing," a silent 10x throughput killer
+even though the threads never touch the same variable.
+
+`alignas(64)` on each atomic forces them onto separate lines. The buffer
+pointer also gets its own line: it's *read* by both sides on every operation,
+and if it shared a line with `tail_`, every consumer index bump would
+invalidate the producer's cached copy of the pointer. (The scaffold version
+had exactly this bug — `buffer_` sat immediately after `tail_`.)
+
+### The cached-index optimization
+
+The scaffold checked full/empty by loading the *other* thread's index on every
+single operation — a guaranteed cross-core cache miss each time. The fix:
+each side keeps a private, non-atomic copy of the other's index and trusts it
+until it *looks* like the queue is full/empty; only then does it reload the
+real atomic:
+
+```cpp
+if (next == tail_cache_) {                            // probably full?
+    tail_cache_ = tail_.load(memory_order_acquire);   // reload reality
+    if (next == tail_cache_) return false;            // actually full
+}
+```
+
+The insight: a stale cache is always *pessimistic* (the consumer only ever
+frees more slots, never un-frees them), so trusting it is safe — worst case
+is one unnecessary reload. In the common case a push touches only the
+producer's own cache line and the slot. This is the difference between ~10M
+and ~100M+ messages/sec.
+
+### Other decisions
+
+- **`static_assert(std::is_trivially_copyable_v<T>)`** — slots are copied
+  with plain assignment while the other thread runs concurrently; only POD
+  types make that safe. This enforces the "messages are fixed-size POD" rule
+  from the plan at compile time.
+- **Heap-backed buffer** (same fix as pool and book): the stress test's queue
+  alone would be megabytes inline — an instant stack overflow on Windows'
+  1MB default stack.
+- **`size()`/`empty()` are labeled racy** — each loads two atomics that can
+  change mid-computation. Fine for monitoring dashboards, never for control
+  flow (that's what the return values of `try_push`/`try_pop` are for).
+- **MSVC warning C4324 silenced** in CMake — it warns that `alignas` padded
+  the struct, which is precisely the intent.
+
+### Test design notes (`spsc_queue_test.cpp`)
+
+- Single-threaded tests pin the edge cases: pop-from-empty leaves the out-
+  param untouched, the `Capacity - 1` usable-slot rule, pop-one-push-one at
+  the full boundary, and index wrap-around over 100 ring cycles.
+- The stress test deliberately uses a *small* (1024-slot) ring for 1M items,
+  unlike the scaffold's 1M-slot ring where the producer would never catch the
+  consumer. A small ring forces thousands of wrap-arounds and constant
+  collisions at the full/empty boundaries — the exact paths where a memory-
+  ordering bug would corrupt or drop items. One caveat kept in mind: x86 has
+  a strong memory model that masks some ordering bugs; the same test running
+  on ARM (weaker model) would be a stricter judge. The acquire/release
+  reasoning above is what makes it correct on both.

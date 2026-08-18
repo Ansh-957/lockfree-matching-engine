@@ -20,7 +20,9 @@ option(BUILD_TOOLS      "Build synthetic generator / replay tools"      OFF)
 
 # Warnings
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    # C4324 warns that alignas() padded a struct - that padding is the whole
+    # point of cache-line alignment, so the warning is noise here
+    add_compile_options(/W4 /permissive- /wd4324)
 else()
     add_compile_options(
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion
@@ -112,7 +114,7 @@ if(BUILD_TESTS)
     add_executable(unit_tests
         test/memory_pool_test.cpp
         test/order_book_test.cpp
-        # test/spsc_queue_test.cpp       # Commit 5
+        test/spsc_queue_test.cpp
         # test/matching_engine_test.cpp  # Commit 6
         # test/feed_parser_test.cpp      # Commit 9
     )

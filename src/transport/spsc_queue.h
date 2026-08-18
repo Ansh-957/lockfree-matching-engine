@@ -1,150 +1,120 @@
 #pragma once
 
-/// @file spsc_queue.h
-/// @brief Lock-free single-producer single-consumer bounded queue.
-///
-/// This is the primary communication channel between threads in the engine.
-/// The design is based on the classic Lamport SPSC queue with cache-line
-/// padding to prevent false sharing between the producer's head and the
-/// consumer's tail.
-///
-/// Memory ordering:
-///   - Producer loads its own head with relaxed, loads tail with acquire,
-///     stores head with release. This ensures the consumer sees the written
-///     item before the updated head.
-///   - Consumer loads its own tail with relaxed, loads head with acquire,
-///     stores tail with release. Symmetric reasoning.
-///
-/// Capacity must be a power of 2 so we can use bitwise AND for index wrapping
-/// instead of the expensive modulo operator.
+// Lock-free single-producer single-consumer bounded ring buffer - the
+// communication channel between the engine's threads
+//
+// Lamport queue with two refinements:
+//   - cache-line padding so the producer's head_ and consumer's tail_
+//     never share a line (no false sharing ping-pong)
+//   - each side keeps a non-atomic cache of the other side's index and
+//     only reloads it when the queue looks full/empty, so most pushes and
+//     pops touch no shared cache line at all
+//
+// Memory ordering contract:
+//   - producer: store head_ with release AFTER writing the slot, so the
+//     consumer's acquire load of head_ guarantees it sees the item
+//   - consumer: store tail_ with release AFTER reading the slot, so the
+//     producer's acquire load of tail_ knows the slot is safe to overwrite
+//
+// Capacity must be a power of 2: index wrapping is a bitwise AND instead
+// of a modulo. One slot is always left unused to tell full from empty,
+// so usable capacity is Capacity - 1
 
-#include <array>
 #include <atomic>
 #include <cstddef>
+#include <memory>
 #include <type_traits>
 
 namespace engine {
 
-/// @brief A bounded, lock-free SPSC (single-producer, single-consumer) queue.
-///
-/// @tparam T         Element type. Should be trivially copyable for best perf.
-/// @tparam Capacity  Maximum number of elements. Must be a power of 2.
-///
-/// Usage:
-/// @code
-///   SPSCQueue<EngineMessage, 65536> queue;
-///
-///   // Producer thread:
-///   queue.try_push(msg);
-///
-///   // Consumer thread:
-///   EngineMessage msg;
-///   if (queue.try_pop(msg)) { /* process msg */ }
-/// @endcode
-template<typename T, size_t Capacity>
+template <typename T, size_t Capacity>
 class SPSCQueue {
     static_assert((Capacity & (Capacity - 1)) == 0,
         "Capacity must be a power of 2 for efficient index wrapping");
-    static_assert(Capacity > 0, "Capacity must be greater than zero");
+    static_assert(Capacity > 1, "Capacity must be at least 2 (one slot is reserved)");
+
+    // slots are copied in and out concurrently with no synchronization on
+    // the element itself - only safe for trivially copyable types
+    static_assert(std::is_trivially_copyable_v<T>,
+        "T must be trivially copyable (messages must be fixed-size POD)");
 
 public:
-    SPSCQueue() = default;
+    // heap-backed: a queue of 64K 48-byte messages is ~3MB, far too big to
+    // live inside the object if anyone puts one on the stack
+    SPSCQueue() : buffer_(std::make_unique<T[]>(Capacity)) {}
 
-    // Non-copyable, non-movable — shared between threads via reference.
+    // shared between threads by reference; moving would tear the indices
     SPSCQueue(const SPSCQueue&)            = delete;
     SPSCQueue& operator=(const SPSCQueue&) = delete;
     SPSCQueue(SPSCQueue&&)                 = delete;
     SPSCQueue& operator=(SPSCQueue&&)      = delete;
 
-    /// @brief Try to enqueue an item (producer side only).
-    /// @param item  The item to enqueue.
-    /// @return true if the item was enqueued, false if the queue is full.
-    ///
-    /// Called by exactly ONE producer thread. Never call from the consumer.
-    bool try_push(const T& item) noexcept(std::is_nothrow_copy_assignable_v<T>) {
-        const size_t current_head = head_.load(std::memory_order_relaxed);
-        const size_t next_head    = (current_head + 1) & kIndexMask;
+    // producer thread only
+    bool try_push(const T& item) noexcept {
+        const size_t head = head_.load(std::memory_order_relaxed);
+        const size_t next = (head + 1) & kIndexMask;
 
-        // Check if queue is full: next write position would collide with tail.
-        if (next_head == tail_.load(std::memory_order_acquire)) {
-            return false;  // Queue is full
+        // queue looks full against our cached view of the consumer - reload
+        // the real tail once before giving up
+        if (next == tail_cache_) {
+            tail_cache_ = tail_.load(std::memory_order_acquire);
+            if (next == tail_cache_) {
+                return false;  // genuinely full
+            }
         }
 
-        buffer_[current_head] = item;
-
-        // Release ensures the item write above is visible before the consumer
-        // sees the updated head.
-        head_.store(next_head, std::memory_order_release);
+        buffer_[head] = item;
+        head_.store(next, std::memory_order_release);
         return true;
     }
 
-    /// @brief Try to dequeue an item (consumer side only).
-    /// @param[out] item  The dequeued item is written here on success.
-    /// @return true if an item was dequeued, false if the queue is empty.
-    ///
-    /// Called by exactly ONE consumer thread. Never call from the producer.
-    bool try_pop(T& item) noexcept(std::is_nothrow_copy_assignable_v<T>) {
-        const size_t current_tail = tail_.load(std::memory_order_relaxed);
+    // consumer thread only
+    bool try_pop(T& item) noexcept {
+        const size_t tail = tail_.load(std::memory_order_relaxed);
 
-        // Check if queue is empty: tail has caught up to head.
-        if (current_tail == head_.load(std::memory_order_acquire)) {
-            return false;  // Queue is empty
+        if (tail == head_cache_) {
+            head_cache_ = head_.load(std::memory_order_acquire);
+            if (tail == head_cache_) {
+                return false;  // genuinely empty
+            }
         }
 
-        item = buffer_[current_tail];
-
-        const size_t next_tail = (current_tail + 1) & kIndexMask;
-
-        // Release ensures the item read above completes before the producer
-        // sees the updated tail and potentially overwrites the slot.
-        tail_.store(next_tail, std::memory_order_release);
+        item = buffer_[tail];
+        tail_.store((tail + 1) & kIndexMask, std::memory_order_release);
         return true;
     }
 
-    /// @brief Approximate size of the queue.
-    ///
-    /// This is inherently racy in a multi-threaded context — the returned
-    /// value may be stale by the time the caller uses it. Useful only for
-    /// monitoring and diagnostics, NOT for control flow decisions.
+    // racy snapshot - monitoring only, never control flow
     [[nodiscard]] size_t size() const noexcept {
         const size_t h = head_.load(std::memory_order_acquire);
         const size_t t = tail_.load(std::memory_order_acquire);
         return (h - t) & kIndexMask;
     }
 
-    /// @brief Check if the queue appears empty (racy, for diagnostics only).
+    // racy snapshot - monitoring only
     [[nodiscard]] bool empty() const noexcept {
         return head_.load(std::memory_order_acquire)
             == tail_.load(std::memory_order_acquire);
     }
 
-    /// @brief Maximum number of elements the queue can hold.
-    [[nodiscard]] static constexpr size_t capacity() noexcept {
-        // Usable capacity is Capacity - 1 because one slot is always unused
-        // (to distinguish full from empty), but we report the template arg.
-        return Capacity;
-    }
+    [[nodiscard]] static constexpr size_t capacity() noexcept { return Capacity; }
 
 private:
-    /// Bitmask for fast modulo: index & kIndexMask == index % Capacity.
     static constexpr size_t kIndexMask = Capacity - 1;
 
-    // -------------------------------------------------------------------
-    // Cache-line-padded indices to prevent false sharing.
-    //
-    // The producer owns head_ and the consumer owns tail_. By placing them
-    // on separate cache lines (64 bytes on x86), writes to one do not
-    // invalidate the cache line holding the other.
-    // -------------------------------------------------------------------
-
-    /// Producer write index. Only the producer thread writes to this.
+    // producer's cache line: the write index it owns, plus its private
+    // cache of the consumer's index
     alignas(64) std::atomic<size_t> head_{0};
+    size_t tail_cache_{0};
 
-    /// Consumer read index. Only the consumer thread writes to this.
+    // consumer's cache line, symmetric
     alignas(64) std::atomic<size_t> tail_{0};
+    size_t head_cache_{0};
 
-    /// Ring buffer storage. Sits after the padded indices.
-    std::array<T, Capacity> buffer_{};
+    // own line: read by both sides on every operation, so it must not share
+    // a line with tail_ - otherwise every consumer index bump would evict
+    // the producer's copy of this pointer (and vice versa)
+    alignas(64) const std::unique_ptr<T[]> buffer_;
 };
 
 } // namespace engine
