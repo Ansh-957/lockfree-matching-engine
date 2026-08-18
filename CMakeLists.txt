@@ -10,19 +10,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# -----------------------------------------------------------------------------
-# Build options — flip these ON as the corresponding phase is implemented.
-# Keeping later-phase targets OFF means the project builds with only GTest
-# installed (no Boost/OpenSSL/simdjson needed until Phase 3).
-# -----------------------------------------------------------------------------
+# Build options - flip ON as each phase is implemented. Keeping later-phase
+# targets OFF means the project builds with no dependencies beyond GTest
+# until Phase 3
 option(BUILD_TESTS      "Build unit tests (GoogleTest)"                 ON)
 option(BUILD_BENCHMARKS "Build micro-benchmarks (Google Benchmark)"     OFF)
 option(BUILD_FEED       "Build live feed pipeline (Boost/simdjson/TLS)" OFF)
 option(BUILD_TOOLS      "Build synthetic generator / replay tools"      OFF)
 
-# -----------------------------------------------------------------------------
-# Compiler warnings — treat warnings seriously
-# -----------------------------------------------------------------------------
+# Warnings
 if(MSVC)
     add_compile_options(/W4 /permissive-)
 else()
@@ -33,15 +29,12 @@ else()
     )
 endif()
 
-# Release builds: aggressive optimization for benchmarking (GCC/Clang only;
-# MSVC's /O2 is already applied by CMake's default Release flags)
+# Release optimization (GCC/Clang only; MSVC Release already uses /O2)
 if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MSVC)
     add_compile_options(-O3 -march=native)
 endif()
 
-# -----------------------------------------------------------------------------
-# Core library — the matching engine itself (no external dependencies)
-# -----------------------------------------------------------------------------
+# Core library - the matching engine itself, no external dependencies
 add_library(engine_core
     src/core/order_book.cpp
     src/core/matching_engine.cpp
@@ -51,9 +44,7 @@ target_include_directories(engine_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
 )
 
-# -----------------------------------------------------------------------------
-# Feed library + main executable — Phase 3 (requires Boost, simdjson, OpenSSL)
-# -----------------------------------------------------------------------------
+# Feed library + main executable - Phase 3
 if(BUILD_FEED)
     find_package(Boost REQUIRED COMPONENTS system)
     find_package(simdjson CONFIG REQUIRED)
@@ -93,22 +84,18 @@ if(BUILD_FEED)
     endif()
 endif()
 
-# -----------------------------------------------------------------------------
-# Tools — Phase 2 (Commit 7)
-# -----------------------------------------------------------------------------
+# Tools - Phase 2 (Commit 7)
 if(BUILD_TOOLS)
     add_executable(synthetic-generator tools/synthetic_generator.cpp)
     target_link_libraries(synthetic-generator PRIVATE engine_core)
 endif()
 
-# -----------------------------------------------------------------------------
-# Tests — sources are added commit by commit as components are finished
-# -----------------------------------------------------------------------------
+# Tests - sources are added commit by commit as components are finished
 if(BUILD_TESTS)
     enable_testing()
 
-    # Prefer a vcpkg/system GTest; fall back to downloading it at configure
-    # time so tests build with zero setup.
+    # prefer a vcpkg/system GTest; fall back to downloading it at configure
+    # time so tests build with zero setup
     find_package(GTest CONFIG QUIET)
     if(NOT GTest_FOUND)
         include(FetchContent)
@@ -117,7 +104,7 @@ if(BUILD_TESTS)
             URL https://github.com/google/googletest/archive/refs/tags/v1.15.2.zip
             DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
-        # On Windows, keep GTest's CRT linkage consistent with our targets.
+        # on Windows, keep GTest's CRT linkage consistent with our targets
         set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(googletest)
     endif()
@@ -139,9 +126,7 @@ if(BUILD_TESTS)
     add_test(NAME unit_tests COMMAND unit_tests)
 endif()
 
-# -----------------------------------------------------------------------------
-# Benchmarks — Phase 2 (Commit 7)
-# -----------------------------------------------------------------------------
+# Benchmarks - Phase 2 (Commit 7)
 if(BUILD_BENCHMARKS)
     find_package(benchmark CONFIG REQUIRED)
 

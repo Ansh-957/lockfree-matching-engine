@@ -1,19 +1,14 @@
 #pragma once
 
-/// @file memory_pool.h
-/// @brief Fixed-size, pre-allocated memory pool with O(1) alloc/dealloc.
-///
-/// The pool makes exactly ONE heap allocation (in the constructor) and then
-/// hands out fixed-size slots from a free list threaded through the unused
-/// slots themselves. After construction there are zero calls to malloc/new
-/// on the allocation path — this is the "zero-malloc hot path" guarantee.
-///
-/// Semantics:
-///   - allocate() returns RAW, uninitialized memory. The caller constructs
-///     the object with placement new:   new (ptr) Order{...};
-///   - Before deallocate(), the caller runs the destructor:  ptr->~Order();
-///   - allocate() returns nullptr when the pool is exhausted. No exceptions
-///     are thrown on the hot path.
+// Fixed-size pre-allocated memory pool with O(1) alloc/dealloc
+//
+// One heap allocation in the constructor, then slots are handed out from a
+// free list threaded through the unused slots themselves - zero malloc on
+// the allocation path after startup
+//
+// allocate() returns RAW uninitialized memory; the caller placement-news
+// the object and runs the destructor before deallocate(). Returns nullptr
+// when exhausted - no exceptions on the hot path
 
 #include <cstddef>
 #include <memory>
@@ -23,22 +18,21 @@ namespace engine {
 
 template <typename T, size_t PoolSize>
 class MemoryPool {
-    // The free list stores a pointer inside each unused slot, so every slot
-    // must be big enough to hold a pointer.
+    // the free list stores a pointer inside each unused slot
     static_assert(sizeof(T) >= sizeof(void*),
         "sizeof(T) must be >= sizeof(void*) so the free-list pointer fits in each slot");
 
-    // storage_ comes from plain operator new[], which only guarantees
-    // alignment up to __STDCPP_DEFAULT_NEW_ALIGNMENT__ (usually 16 bytes).
+    // plain operator new[] only guarantees alignment up to
+    // __STDCPP_DEFAULT_NEW_ALIGNMENT__ (usually 16 bytes)
     static_assert(alignof(T) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__,
         "T requires stricter alignment than operator new provides");
 
     static_assert(PoolSize > 0, "PoolSize must be greater than zero");
 
 public:
-    // One heap allocation for the whole lifetime of the pool, then thread
-    // the free list through the slots (in reverse so the first allocate()
-    // returns the lowest address — friendlier for the cache on warm-up).
+    // link the free list in reverse so the first allocate() returns the
+    // lowest address - the initial burst of allocations then walks memory
+    // front to back, which the hardware prefetcher likes
     MemoryPool()
         : storage_(std::make_unique<std::byte[]>(sizeof(T) * PoolSize)) {
         for (size_t i = PoolSize; i > 0; --i) {
@@ -48,15 +42,14 @@ public:
         }
     }
 
-    // Non-copyable, non-movable: outstanding pointers into storage_ must
-    // stay valid for the pool's whole lifetime.
+    // outstanding pointers into storage_ must stay valid for the pool's
+    // whole lifetime, so copying/moving is forbidden
     MemoryPool(const MemoryPool&)            = delete;
     MemoryPool& operator=(const MemoryPool&) = delete;
     MemoryPool(MemoryPool&&)                 = delete;
     MemoryPool& operator=(MemoryPool&&)      = delete;
 
-    /// Pop a slot off the free list.
-    /// @return Raw uninitialized memory for one T, or nullptr if exhausted.
+    // pop a slot off the free list; nullptr if exhausted
     [[nodiscard]] T* allocate() noexcept {
         if (free_head_ == nullptr) {
             return nullptr;
@@ -67,9 +60,8 @@ public:
         return reinterpret_cast<T*>(node);
     }
 
-    /// Push a slot back onto the free list.
-    /// @pre ptr came from this pool's allocate() and the object's destructor
-    ///      has already been run.
+    // push a slot back onto the free list
+    // caller must have already run the object's destructor
     void deallocate(T* ptr) noexcept {
         auto* node = reinterpret_cast<FreeNode*>(ptr);
         node->next = free_head_;
@@ -77,10 +69,8 @@ public:
         ++available_;
     }
 
-    /// Number of slots currently free.
     [[nodiscard]] size_t available() const noexcept { return available_; }
 
-    /// Total number of slots (compile-time constant).
     [[nodiscard]] static constexpr size_t capacity() noexcept { return PoolSize; }
 
 private:
@@ -88,17 +78,14 @@ private:
         FreeNode* next;
     };
 
-    // Convert a slot index into an address inside the raw byte buffer.
-    // We deal in raw bytes (not T[]) so that no T objects are constructed
-    // until the caller placement-news into a slot.
+    // raw bytes, not T[], so no T objects are constructed until the caller
+    // placement-news into a slot
     [[nodiscard]] std::byte* slot_ptr(size_t index) noexcept {
         return &storage_[index * sizeof(T)];
     }
 
-    // Heap-backed, NOT an inline member array: a pool of 1M Orders is ~64MB,
-    // which would instantly overflow the stack if the pool were a local
-    // variable. One new[] at construction is acceptable — the zero-malloc
-    // guarantee applies after initialization.
+    // heap-backed, NOT an inline member array: a pool of 1M Orders is ~64MB
+    // and would overflow the stack if the pool were a local variable
     std::unique_ptr<std::byte[]> storage_;
 
     FreeNode* free_head_ = nullptr;

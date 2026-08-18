@@ -1,10 +1,10 @@
-// memory_pool_test.cpp — Unit tests for engine::MemoryPool
+// Unit tests for engine::MemoryPool
 //
-// The pool's contract under test:
-//   - allocate() returns raw memory; caller placement-news the object.
-//   - allocate() returns nullptr (does NOT throw) when the pool is exhausted.
-//   - deallocate() returns a slot to the pool for reuse.
-//   - Slots never overlap; each allocation is a distinct, usable region.
+// Contract under test:
+//   - allocate() returns raw memory; caller placement-news the object
+//   - allocate() returns nullptr (does NOT throw) when the pool is exhausted
+//   - deallocate() returns a slot to the pool for reuse
+//   - slots never overlap; each allocation is a distinct usable region
 
 #include <gtest/gtest.h>
 #include "core/memory_pool.h"
@@ -34,7 +34,7 @@ TEST(MemoryPoolTest, AllocateAndDeallocate) {
 }
 
 TEST(MemoryPoolTest, PoolExhaustion) {
-    // Allocate every slot, then verify the next allocation returns nullptr.
+    // allocate every slot, then the next allocation must return nullptr
     engine::MemoryPool<engine::Order, kPoolCapacity> pool;
 
     std::vector<engine::Order*> ptrs;
@@ -47,7 +47,7 @@ TEST(MemoryPoolTest, PoolExhaustion) {
     }
 
     EXPECT_EQ(pool.available(), 0u);
-    EXPECT_EQ(pool.allocate(), nullptr);  // exhausted — no throw, just nullptr
+    EXPECT_EQ(pool.allocate(), nullptr);
 
     for (auto* p : ptrs) {
         pool.deallocate(p);
@@ -55,7 +55,6 @@ TEST(MemoryPoolTest, PoolExhaustion) {
 }
 
 TEST(MemoryPoolTest, AllPointersDistinct) {
-    // No two allocations may return the same slot.
     engine::MemoryPool<engine::Order, kPoolCapacity> pool;
 
     std::vector<engine::Order*> ptrs;
@@ -74,7 +73,7 @@ TEST(MemoryPoolTest, AllPointersDistinct) {
 }
 
 TEST(MemoryPoolTest, ReuseAfterDeallocation) {
-    // Exhaust the pool, free one slot, and verify it can be re-allocated.
+    // exhaust the pool, free one slot, verify it can be re-allocated
     engine::MemoryPool<engine::Order, kPoolCapacity> pool;
 
     std::vector<engine::Order*> ptrs;
@@ -83,7 +82,7 @@ TEST(MemoryPoolTest, ReuseAfterDeallocation) {
         ptrs.push_back(pool.allocate());
     }
 
-    EXPECT_EQ(pool.allocate(), nullptr);  // exhausted
+    EXPECT_EQ(pool.allocate(), nullptr);
 
     engine::Order* freed = ptrs.back();
     pool.deallocate(freed);
@@ -91,7 +90,7 @@ TEST(MemoryPoolTest, ReuseAfterDeallocation) {
 
     auto* reused = pool.allocate();
     EXPECT_NE(reused, nullptr);
-    // The free list is LIFO, so the just-freed slot should come back first.
+    // the free list is LIFO, so the just-freed slot comes back first
     EXPECT_EQ(reused, freed);
 
     ptrs.push_back(reused);
@@ -101,8 +100,8 @@ TEST(MemoryPoolTest, ReuseAfterDeallocation) {
 }
 
 TEST(MemoryPoolTest, AllSlotsUsable) {
-    // Construct a real Order in every slot, write a unique ID, and read it
-    // back — proves no slot overlap or corruption.
+    // construct a real Order in every slot, write a unique ID, read it
+    // back - proves no slot overlap or corruption
     engine::MemoryPool<engine::Order, kPoolCapacity> pool;
 
     std::vector<engine::Order*> ptrs;
@@ -111,7 +110,7 @@ TEST(MemoryPoolTest, AllSlotsUsable) {
     for (std::size_t i = 0; i < kPoolCapacity; ++i) {
         auto* p = pool.allocate();
         ASSERT_NE(p, nullptr);
-        new (p) engine::Order{};  // placement new — caller constructs
+        new (p) engine::Order{};
         p->id = static_cast<engine::OrderId>(i);
         ptrs.push_back(p);
     }
@@ -122,7 +121,7 @@ TEST(MemoryPoolTest, AllSlotsUsable) {
     }
 
     for (auto* p : ptrs) {
-        p->~Order();  // caller destroys before returning the slot
+        p->~Order();
         pool.deallocate(p);
     }
     EXPECT_EQ(pool.available(), kPoolCapacity);

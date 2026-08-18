@@ -202,3 +202,87 @@ sequential pattern and pulls cache lines in ahead of use.
 `memory_pool_reference.h` (the scaffold's stashed implementation) was deleted —
 it had served its purpose as a study reference and is recoverable from git
 history (`git show 68bcba4:src/core/memory_pool_reference.h`).
+
+---
+
+## Commit 3 — Intrusive Doubly-Linked List (`price_level.h`)
+
+### What a PriceLevel is
+
+One `PriceLevel` = the FIFO queue of all resting orders at one exact price.
+The order book is (conceptually) 10 million of these, one per tick. "Price-time
+priority" falls out of the structure naturally:
+
+- **Price priority** is handled by *which* PriceLevel an order sits in.
+- **Time priority** is handled by FIFO order *within* the level: new orders
+  `push_back`, the matcher always consumes `front()` (the oldest).
+
+### Why doubly-linked (not singly-linked)
+
+A singly-linked list can push_back and pop_front in O(1), which covers adding
+orders and matching. But it *cannot* remove an arbitrary middle element in O(1)
+— you'd need the predecessor, which means walking the list. Cancels hit random
+positions in the queue, and real crypto feeds are cancel-heavy (often >90% of
+messages). The `prev` pointer costs 8 bytes per order and buys O(1) cancel:
+
+```
+remove(order):                        before:  A ⇄ B ⇄ C
+    order->prev->next = order->next;  unlink B: A ⇄ C
+    order->next->prev = order->prev;  (plus nullptr edge cases at head/tail)
+```
+
+Four pointer writes, no traversal, no matter where the order is in the queue.
+
+### How the operations work
+
+- **`push_back`** — new order becomes the tail. If the list was empty it also
+  becomes the head. Two branches, a handful of writes.
+- **`remove`** — the unlink above. If `prev` is null the order was the head, so
+  the head moves; if `next` is null it was the tail. After unlinking, the
+  order's own pointers are reset to nullptr so a stale `prev`/`next` can never
+  be followed later (this is the "no memory faults" property the commit plan
+  asks for).
+- **`pop_front`** — special-cased head removal used on the matching path.
+  Slightly cheaper than `remove(front())` because it skips the prev-side
+  branches, and it returns the popped order so the matcher can fill it.
+- **`reduce_quantity`** — see below.
+
+### Why `total_quantity` is maintained incrementally
+
+The matcher and (later) the dashboard constantly ask "how much size is resting
+at this price?". Recomputing that would be a full list walk — O(n) pointer
+chasing over potentially thousands of orders, each a likely cache miss.
+Instead every mutation keeps a running total: `push_back` adds the order's
+remaining quantity, `remove`/`pop_front` subtract it, and `reduce_quantity(qty)`
+subtracts a partial fill. Reading it is then a single load, O(1).
+
+The subtle ordering rule: on a partial fill, the matcher updates the *order's*
+`filled_quantity` and must call `reduce_quantity` with the filled amount. On
+remove/pop the level subtracts `remaining_quantity()` — which is why the
+order's fill state must be updated *before* it is removed, or the aggregate
+would drift.
+
+### Why PriceLevel is non-copyable and non-movable
+
+The levels live in a fixed flat array inside `OrderBook`. If one were copied,
+two levels would point at the same order chain; if moved, orders' `prev/next`
+would still point into the old location. `= delete` on all four special members
+turns both mistakes into compile errors.
+
+### Why everything is in the header
+
+Every method is a few pointer operations. Defining them in the header lets the
+compiler inline them into the matching loop — a function call would cost more
+than the operation itself. There is no `price_level.cpp`.
+
+### Testing note
+
+Per the commit plan, PriceLevel has no dedicated test file — it is exercised
+indirectly (and thoroughly) by `order_book_test.cpp` in Commit 4, since every
+order book operation drives the list through push/remove/pop cycles.
+
+### Housekeeping in this commit
+
+Comment style cleanup across all files built so far: removed Doxygen `///`
+blocks, `@file`/`@brief`/`@param` tags, dash-row section banners, and trailing
+periods on comments. Comments now only say things the code can't.
