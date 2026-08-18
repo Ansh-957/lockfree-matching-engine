@@ -51,47 +51,38 @@ target_include_directories(engine_core PUBLIC
 )
 target_link_libraries(engine_core PRIVATE engine_warnings)
 
-# Feed library + main executable - Phase 3
+# Feed library - Phase 3, built commit by commit
 if(BUILD_FEED)
-    find_package(Boost REQUIRED COMPONENTS system)
-    find_package(simdjson CONFIG REQUIRED)
-    find_package(spdlog CONFIG REQUIRED)
+    # Beast/Asio are header-only; OpenSSL provides the TLS implementation
+    find_package(Boost REQUIRED)
     find_package(OpenSSL REQUIRED)
+    find_package(Threads REQUIRED)
 
     add_library(engine_feed
         src/feed/ws_client.cpp
-        src/feed/coinbase_feed.cpp
-        src/feed/feed_handler.cpp
+        # src/feed/coinbase_feed.cpp     # Commit 9 (needs simdjson)
+        # src/feed/feed_handler.cpp      # Commit 9
     )
     target_include_directories(engine_feed PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(engine_feed PRIVATE engine_warnings)
     target_link_libraries(engine_feed PUBLIC
         engine_core
-        Boost::system
-        simdjson::simdjson
-        spdlog::spdlog
+        Boost::headers
         OpenSSL::SSL
         OpenSSL::Crypto
+        Threads::Threads
     )
 
-    add_library(engine_metrics
-        src/metrics/metrics_collector.cpp
-        src/metrics/trade_logger.cpp
-    )
-    target_include_directories(engine_metrics PUBLIC ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(engine_metrics PRIVATE engine_warnings)
-    target_link_libraries(engine_metrics PUBLIC engine_core spdlog::spdlog)
+    # Commit 8 verification: live handshake against the Coinbase feed
+    add_executable(ws-smoke tools/ws_client_smoke.cpp)
+    target_link_libraries(ws-smoke PRIVATE engine_feed engine_warnings)
 
-    add_executable(matching-engine src/main.cpp)
-    target_link_libraries(matching-engine PRIVATE
-        engine_core
-        engine_feed
-        engine_metrics
-        engine_warnings
-    )
-    if(NOT MSVC)
-        target_link_libraries(matching-engine PRIVATE pthread)
-    endif()
+    # Commit 10/11: main executable + metrics library
+    # add_library(engine_metrics
+    #     src/metrics/metrics_collector.cpp
+    #     src/metrics/trade_logger.cpp
+    # )
+    # add_executable(matching-engine src/main.cpp)
 endif()
 
 # Tools - Phase 2 (Commit 7)
