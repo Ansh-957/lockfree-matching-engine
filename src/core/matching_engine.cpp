@@ -1,112 +1,126 @@
-/// @file matching_engine.cpp
-/// @brief Implementation of the matching engine's order processing logic.
-
 #include "core/matching_engine.h"
 
-#include <new>  // for placement new
+#include <algorithm>
+#include <new>
 
 namespace engine {
 
-// ---------------------------------------------------------------------------
-// process_new_order
-// ---------------------------------------------------------------------------
-
-std::vector<Fill> MatchingEngine::process_new_order(const NewOrderMessage& msg) {
-    // TODO: Phase 1 — Implement the matching algorithm.
-    //
-    // Detailed algorithm (price-time priority matching):
-    //
-    //   1. ALLOCATE: Get raw memory from pool_ and placement-new an Order.
-    //
-    //      Order* order = pool_.allocate();
-    //      new (order) Order{
-    //          .id = msg.id, .side = msg.side, .type = msg.type,
-    //          .price = msg.price, .quantity = msg.quantity,
-    //          .filled_quantity = 0, .timestamp = msg.timestamp
-    //      };
-    //
-    //   2. MATCH: Walk the opposite side of the book from the best price.
-    //
-    //      For a BUY order:
-    //        - Start at best_ask (the lowest ask price).
-    //        - While order has remaining quantity AND best_ask <= order->price
-    //          (or unconditionally for Market orders):
-    //            a. Get the PriceLevel at best_ask.
-    //            b. While the level is non-empty AND order has remaining qty:
-    //               - Take the front() resting order.
-    //               - fill_qty = min(order->remaining(), passive->remaining()).
-    //               - Update both orders' filled_quantity.
-    //               - Update the level's total_quantity (reduce_quantity).
-    //               - Emit a Fill{aggressive=order->id, passive=passive->id, ...}.
-    //               - If passive is fully filled, pop_front() and deallocate.
-    //            c. Move to next ask level (best_ask + 1).
-    //
-    //      For a SELL order:
-    //        - Start at best_bid (the highest bid price).
-    //        - Walk downward symmetrically.
-    //
-    //   3. REST OR DISCARD:
-    //      - If order has remaining quantity AND is a Limit order:
-    //        - Call book_.add_order(order) to rest it in the book.
-    //      - Else (fully filled, or Market order with no more liquidity):
-    //        - Destroy and deallocate: order->~Order(); pool_.deallocate(order);
-    //
-    //   4. RETURN: Return the vector of Fill structs.
-
-    std::vector<Fill> fills;
-
-    // --- Stub: allocate and immediately rest (no matching yet) ---
-    Order* order = pool_.allocate();
-    new (order) Order{};
-    order->id              = msg.id;
-    order->side            = msg.side;
-    order->type            = msg.type;
-    order->price           = msg.price;
-    order->quantity        = msg.quantity;
-    order->filled_quantity = 0;
-    order->timestamp       = msg.timestamp;
-
-    // TODO: Implement matching loop here.
-    // For now, just rest the order in the book.
-    if (order->type == OrderType::Limit) {
-        book_.add_order(order);
-    } else {
-        // Market orders with no matching logic yet — just discard.
-        order->~Order();
-        pool_.deallocate(order);
-    }
-
-    return fills;
+MatchingEngine::MatchingEngine() {
+    fills_.reserve(1024);
 }
 
-// ---------------------------------------------------------------------------
-// process_cancel
-// ---------------------------------------------------------------------------
+const std::vector<Fill>& MatchingEngine::process(const EngineMessage& msg) {
+    if (const auto* order = std::get_if<NewOrderMessage>(&msg)) {
+        return process_new_order(*order);
+    }
+    fills_.clear();
+    process_cancel(std::get<CancelMessage>(msg));
+    return fills_;
+}
+
+const std::vector<Fill>& MatchingEngine::process_new_order(const NewOrderMessage& msg) {
+    fills_.clear();
+
+    Quantity remaining = msg.quantity;
+    if (remaining == 0) {
+        return fills_;
+    }
+
+    const bool is_limit = (msg.type == OrderType::Limit);
+    if (is_limit && (msg.price < 0 || msg.price >= MAX_PRICE_TICKS)) {
+        return fills_;
+    }
+
+    // match against the opposite side, best price first. The book repairs
+    // best_bid/best_ask as levels empty, so re-reading it each iteration
+    // walks the levels in price order
+    if (msg.side == Side::Bid) {
+        while (remaining > 0 && book_.has_asks()) {
+            const Price level_price = book_.best_ask();
+            if (is_limit && level_price > msg.price) {
+                break;  // book no longer crosses our limit
+            }
+            remaining = fill_level(level_price, msg.id, msg.timestamp, remaining);
+        }
+    } else {
+        while (remaining > 0 && book_.has_bids()) {
+            const Price level_price = book_.best_bid();
+            if (is_limit && level_price < msg.price) {
+                break;
+            }
+            remaining = fill_level(level_price, msg.id, msg.timestamp, remaining);
+        }
+    }
+
+    // rest the remainder - limit orders only, market remainders are discarded.
+    // The pool is only touched if something actually rests: pure takers make
+    // no allocation at all, and an exhausted pool degrades to dropping the
+    // residual instead of crashing
+    if (remaining > 0 && is_limit) {
+        Order* order = pool_.allocate();
+        if (order == nullptr) {
+            return fills_;
+        }
+        new (order) Order{};
+        order->id              = msg.id;
+        order->side            = msg.side;
+        order->type            = msg.type;
+        order->price           = msg.price;
+        order->quantity        = msg.quantity;
+        order->filled_quantity = msg.quantity - remaining;
+        order->timestamp       = msg.timestamp;
+
+        if (!book_.add_order(order)) {  // duplicate id
+            order->~Order();
+            pool_.deallocate(order);
+        }
+    }
+
+    return fills_;
+}
 
 bool MatchingEngine::process_cancel(const CancelMessage& msg) {
-    // TODO: Phase 1 — Implement cancel logic.
-    //
-    // Algorithm:
-    //   1. Look up the order: Order* order = book_.get_order(msg.id);
-    //   2. If not found, return false.
-    //   3. Remove from book: book_.cancel_order(msg.id);
-    //   4. Destroy and return to pool:
-    //        order->~Order();
-    //        pool_.deallocate(order);
-    //   5. Return true.
-
     Order* order = book_.get_order(msg.id);
-    if (!order) {
+    if (order == nullptr) {
         return false;
     }
 
     book_.cancel_order(msg.id);
 
-    // Return the memory to the pool.
     order->~Order();
     pool_.deallocate(order);
-
     return true;
+}
+
+Quantity MatchingEngine::fill_level(Price level_price, OrderId aggressive_id,
+                                    Timestamp ts, Quantity remaining) {
+    PriceLevel& level = book_.get_level_mut(level_price);
+
+    while (remaining > 0 && !level.empty()) {
+        Order* passive = level.front();
+
+        const Quantity qty = std::min(remaining, passive->remaining_quantity());
+
+        // fill state must be updated BEFORE any removal, so the level's
+        // aggregate (which subtracts remaining_quantity on remove) stays
+        // consistent - see the ordering rule in price_level.h
+        passive->filled_quantity += qty;
+        level.reduce_quantity(qty);
+        remaining -= qty;
+
+        // execution at the passive order's price
+        fills_.push_back({aggressive_id, passive->id, level_price, qty, ts});
+
+        if (passive->is_filled()) {
+            // unlinks (subtracting 0 remaining), erases from the id map,
+            // fixes side counters and best prices if the level emptied
+            book_.cancel_order(passive->id);
+            passive->~Order();
+            pool_.deallocate(passive);
+        }
+    }
+
+    return remaining;
 }
 
 } // namespace engine

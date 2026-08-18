@@ -115,7 +115,7 @@ if(BUILD_TESTS)
         test/memory_pool_test.cpp
         test/order_book_test.cpp
         test/spsc_queue_test.cpp
-        # test/matching_engine_test.cpp  # Commit 6
+        test/matching_engine_test.cpp
         # test/feed_parser_test.cpp      # Commit 9
     )
 

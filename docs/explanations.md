@@ -507,3 +507,107 @@ and ~100M+ messages/sec.
   a strong memory model that masks some ordering bugs; the same test running
   on ARM (weaker model) would be a stricter judge. The acquire/release
   reasoning above is what makes it correct on both.
+
+---
+
+## Commit 6 — The Matching Loop (`message.h`, `matching_engine.h/.cpp`)
+
+### Message types and `std::variant`
+
+`message.h` defines the POD structs that flow through the SPSC queues, plus
+two tagged unions:
+
+```cpp
+using EngineMessage = std::variant<NewOrderMessage, CancelMessage>;
+```
+
+A `std::variant` is a type-safe union: it holds exactly one of its
+alternatives at a time plus a hidden tag saying which. Unlike a raw C union
+you can't read the wrong member — `std::get_if<T>` returns nullptr if the
+tag doesn't match. Crucially, a variant over trivially copyable types is
+itself trivially copyable, so variants can travel through the SPSC queue
+directly; the `static_assert`s in the header prove it at compile time.
+
+The scaffold had a separate `Fill` struct identical to `FillMessage`; that
+duplication is gone (`using Fill = FillMessage`) — a fill *is* the outbound
+message, no translation step.
+
+### The matching algorithm
+
+Price-time priority falls out of two nested loops:
+
+```
+outer loop (PRICE priority):  walk levels from the best opposite price inward
+    re-read book.best_ask() each iteration - the book repairs it as levels empty
+    limit orders break when the level no longer crosses their limit
+inner loop (TIME priority):   fill_level() consumes orders front-to-back (FIFO)
+```
+
+Per fill: take `min(incoming remaining, passive remaining)`, update the
+passive order's `filled_quantity`, subtract from the level aggregate
+(`reduce_quantity` — *this* is where the ordering rule from Commit 3
+matters), emit a fill, and if the passive order is done, remove it via
+`book_.cancel_order()` — which already handles the map erase, side counters,
+and best-price repair — then return its slot to the pool.
+
+Three rules encode exchange semantics:
+
+- **Execution at the passive price.** A bid at 100.50 hitting an ask resting
+  at 100.00 trades at 100.00 — the maker set the price, the taker accepted
+  it. This is how real venues work, and it gives price *improvement* to the
+  aggressor, never worse.
+- **Limit orders stop at their limit; the remainder rests.** After the loop
+  breaks, any unfilled quantity becomes a resting order at the limit price —
+  with `filled_quantity` carried over, so a 100-lot that matched 30 rests
+  showing 70 remaining.
+- **Market orders never rest.** They sweep until filled or the side is
+  empty; any remainder is simply discarded (there is no price at which a
+  market order could rest).
+
+This also maintains the **uncrossed-book invariant** from Commit 4: an
+incoming order only rests after consuming everything it crosses, so bids and
+asks can never overlap.
+
+### Interface change: no vector-by-value on the hot path
+
+The scaffold returned `std::vector<Fill>` by value — a fresh heap allocation
+per processed order, which would have been the single biggest cost in the
+whole pipeline and a violation of the zero-malloc rule. The engine now owns
+one `fills_` vector, reserved to 1024 at construction, cleared (which keeps
+capacity) and reused every call, returned by const reference. Steady state:
+zero allocations. The trade-off is a lifetime rule — the returned reference
+is valid only until the next `process` call — which is fine for the intended
+single-threaded drain loop and is documented in the header.
+
+### Allocate late: takers never touch the pool
+
+The scaffold allocated a pool slot for every incoming order and freed it if
+the order didn't rest. The engine now matches using just the message fields
+and a local `remaining` counter, and only allocates when a residual actually
+needs to rest. Consequences:
+
+- a pure taker (fully filled on arrival) costs zero pool traffic;
+- pool exhaustion degrades gracefully — the residual is dropped instead of
+  crashing (a real venue would reject the order; we note the policy);
+- allocation failure can't corrupt matching, because fills have already
+  happened by the time we try to rest.
+
+### Ownership summary (who frees what)
+
+The pool is the only allocator; the book never allocates or frees. An order's
+slot is returned in exactly one of three places: it was fully filled during
+matching (`fill_level` frees it), it was cancelled (`process_cancel` frees
+it), or it never rested (market remainder/duplicate id — freed immediately).
+The `PoolAccountingAcrossMixedFlow` test walks a mixed scenario asserting
+`pool_available()` at each step to prove no slot leaks.
+
+### Test design notes (`matching_engine_test.cpp`)
+
+All five scaffold scenarios are implemented (cross, partial fill, price-time
+priority, market sweep, cancel) plus the edges that catch real matching bugs:
+execution at the passive price, a better-priced level filling before an
+earlier-quoted worse one, a limit order sweeping one level then stopping at
+its price while the next level survives, market order on an empty book, and
+cancelling an already-filled order (must fail — the order is gone). Fill
+assertions check the aggressive/passive id pairing, not just quantities, to
+pin down who traded with whom.
