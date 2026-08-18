@@ -7,6 +7,9 @@ out/
 # vcpkg
 vcpkg_installed/
 
+# Local toolchain (cmake/ninja binaries, not part of the project)
+.toolchain/
+
 # IDE
 .vscode/
 .idea/

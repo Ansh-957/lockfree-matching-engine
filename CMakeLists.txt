@@ -14,17 +14,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # targets OFF means the project builds with no dependencies beyond GTest
 # until Phase 3
 option(BUILD_TESTS      "Build unit tests (GoogleTest)"                 ON)
-option(BUILD_BENCHMARKS "Build micro-benchmarks (Google Benchmark)"     OFF)
+option(BUILD_BENCHMARKS "Build micro-benchmarks (Google Benchmark)"     ON)
 option(BUILD_FEED       "Build live feed pipeline (Boost/simdjson/TLS)" OFF)
-option(BUILD_TOOLS      "Build synthetic generator / replay tools"      OFF)
+option(BUILD_TOOLS      "Build synthetic generator / replay tools"      ON)
 
-# Warnings
+# Warnings - attached per-target (not add_compile_options) so they apply to
+# OUR code only; FetchContent'd dependencies (GTest, Google Benchmark) build
+# with their own warning sets, and benchmark's -Werror would otherwise turn
+# our extra -Wconversion warnings in ITS code into build failures
+add_library(engine_warnings INTERFACE)
 if(MSVC)
     # C4324 warns that alignas() padded a struct - that padding is the whole
     # point of cache-line alignment, so the warning is noise here
-    add_compile_options(/W4 /permissive- /wd4324)
+    target_compile_options(engine_warnings INTERFACE /W4 /permissive- /wd4324)
 else()
-    add_compile_options(
+    target_compile_options(engine_warnings INTERFACE
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion
         -Wnon-virtual-dtor -Wold-style-cast -Wcast-align
         -Woverloaded-virtual -Wsign-conversion
@@ -45,6 +49,7 @@ add_library(engine_core
 target_include_directories(engine_core PUBLIC
     ${CMAKE_SOURCE_DIR}/src
 )
+target_link_libraries(engine_core PRIVATE engine_warnings)
 
 # Feed library + main executable - Phase 3
 if(BUILD_FEED)
@@ -59,6 +64,7 @@ if(BUILD_FEED)
         src/feed/feed_handler.cpp
     )
     target_include_directories(engine_feed PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(engine_feed PRIVATE engine_warnings)
     target_link_libraries(engine_feed PUBLIC
         engine_core
         Boost::system
@@ -73,6 +79,7 @@ if(BUILD_FEED)
         src/metrics/trade_logger.cpp
     )
     target_include_directories(engine_metrics PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(engine_metrics PRIVATE engine_warnings)
     target_link_libraries(engine_metrics PUBLIC engine_core spdlog::spdlog)
 
     add_executable(matching-engine src/main.cpp)
@@ -80,6 +87,7 @@ if(BUILD_FEED)
         engine_core
         engine_feed
         engine_metrics
+        engine_warnings
     )
     if(NOT MSVC)
         target_link_libraries(matching-engine PRIVATE pthread)
@@ -89,7 +97,7 @@ endif()
 # Tools - Phase 2 (Commit 7)
 if(BUILD_TOOLS)
     add_executable(synthetic-generator tools/synthetic_generator.cpp)
-    target_link_libraries(synthetic-generator PRIVATE engine_core)
+    target_link_libraries(synthetic-generator PRIVATE engine_core engine_warnings)
 endif()
 
 # Tests - sources are added commit by commit as components are finished
@@ -121,6 +129,7 @@ if(BUILD_TESTS)
 
     target_link_libraries(unit_tests PRIVATE
         engine_core
+        engine_warnings
         GTest::gtest
         GTest::gtest_main
     )
@@ -130,14 +139,35 @@ endif()
 
 # Benchmarks - Phase 2 (Commit 7)
 if(BUILD_BENCHMARKS)
-    find_package(benchmark CONFIG REQUIRED)
+    # prefer a vcpkg/system Google Benchmark; fall back to downloading it at
+    # configure time (same pattern as GTest above)
+    find_package(benchmark CONFIG QUIET)
+    if(NOT benchmark_FOUND)
+        include(FetchContent)
+        set(BENCHMARK_ENABLE_TESTING     OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_INSTALL     OFF CACHE BOOL "" FORCE)
+        set(BENCHMARK_ENABLE_WERROR      OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            googlebenchmark
+            URL https://github.com/google/benchmark/archive/refs/tags/v1.9.0.zip
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(googlebenchmark)
+    endif()
+
+    find_package(Threads REQUIRED)
 
     foreach(bench_name order_book_bench ring_buffer_bench matching_bench memory_pool_bench)
         add_executable(${bench_name} bench/${bench_name}.cpp)
+        # CMAKE_SOURCE_DIR so benchmarks can include "tools/synthetic_workload.h"
+        target_include_directories(${bench_name} PRIVATE ${CMAKE_SOURCE_DIR})
         target_link_libraries(${bench_name} PRIVATE
             engine_core
+            engine_warnings
             benchmark::benchmark
             benchmark::benchmark_main
+            Threads::Threads
         )
     endforeach()
 endif()

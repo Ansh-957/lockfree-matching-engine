@@ -611,3 +611,183 @@ its price while the next level survives, market order on an empty book, and
 cancelling an already-filled order (must fail — the order is gone). Fill
 assertions check the aggressive/passive id pairing, not just quantities, to
 pin down who traded with whom.
+
+---
+
+## Commit 7 — Micro-benchmarking Framework (`synthetic_workload.h`, `synthetic_generator.cpp`, `order_book_bench.cpp`, `ring_buffer_bench.cpp`)
+
+### How Google Benchmark works (and the primitives used everywhere)
+
+Google Benchmark runs your code in a loop and *decides the iteration count
+itself*: it keeps increasing iterations until the total runtime is
+statistically stable (default ~1s per benchmark), then reports time per
+iteration. That's why every benchmark has the shape:
+
+```cpp
+for (auto _ : state) { /* the ONE operation being measured */ }
+```
+
+Four primitives appear throughout our benchmarks:
+
+- **`benchmark::DoNotOptimize(x)`** — tells the optimizer "assume `x` is
+  used." Without it, a Release-mode compiler sees that a result is never read
+  and deletes the entire computation — you'd be measuring an empty loop.
+- **`benchmark::ClobberMemory()`** — a compiler-level memory barrier: "assume
+  all memory was touched." Stops the compiler from caching writes in
+  registers across iterations.
+- **`state.PauseTiming()` / `ResumeTiming()`** — stop the clock for periodic
+  housekeeping (refilling a drained book, rebuilding an engine). The pause
+  itself has overhead (~100ns+), so it must never wrap the *hot* operation —
+  we only use it for work that happens once per *batch*, amortized to ~zero.
+- **`state.SetItemsProcessed(n)`** — converts "ns/iteration" into
+  "operations/second" in the report, which is the number the plan's targets
+  are written in.
+
+### Why the workload generator became a header (`tools/synthetic_workload.h`)
+
+The commit plan asks the generator to "cycle millions of requests through
+Google Benchmark" *and* to write files for the replay tool. Those are two
+consumers of the same logic, so the generation moved into a reusable class
+(`synth::WorkloadGenerator`) and the CLI (`synthetic_generator.cpp`) became a
+thin wrapper that serializes the stream to disk. The benchmarks call
+`generate(n)` directly — no file round-trip.
+
+Two properties were designed in:
+
+- **Determinism.** Fixed RNG seed *and* logical-counter timestamps (no
+  wall-clock reads). Two runs with the same config produce byte-identical
+  streams, so a benchmark number today is comparable with one next week —
+  you're never chasing a regression that was actually a different workload.
+- **Well-formed cancels.** Cancels always target a randomly chosen still-live
+  order id, tracked in a `live_ids_` vector with **swap-and-pop** removal
+  (swap the chosen element with the last, `pop_back`) — O(1) removal where
+  erase-from-middle would be O(n). Only *limit* orders enter the live set:
+  market orders never rest, so cancelling one is meaningless. The engine may
+  have already filled an order the generator still considers live — that
+  cancel returns false, which is realistic (exchanges race cancels against
+  fills all day).
+
+### Order book benchmark design (`order_book_bench.cpp`)
+
+**One book per benchmark, reused across iterations.** A fresh book is a
+~240MB allocation; constructing one per iteration would be the entire
+measurement. This is the flip side of the test suite's choice (isolation via
+fresh books) — benchmarks want steady-state, tests want isolation.
+
+**Disjoint price bands.** The standalone `OrderBook` relies on the engine to
+keep it uncrossed (Commit 4). Benchmarks that drive the book directly
+(add/cancel) generate bids in one band (~$99.50) and asks in another
+(~$100.50) so the invariant holds with no matcher present.
+
+Per-benchmark decisions:
+
+- **`BM_AddOrder`** — a 65K-order arena is regenerated and the book drained
+  every 65K iterations, off the clock. Measures: level append + hash map
+  insert + best-price comparison. The arena is a `std::vector<Order>` sized
+  once — the benchmark itself does zero allocation on the timed path.
+- **`BM_CancelOrder`** — cancels in *shuffled* order, not insertion order.
+  Sequential cancels would drain levels in a fixed pattern; random cancels
+  hit middles of queues and occasionally empty the best level, exercising
+  the lazy best-price rescan the way real flow does.
+- **`BM_MatchOrder`** — the "giant maker" trick: rest one ask with quantity
+  10⁹, then send one-lot crossing bids. Each iteration produces exactly one
+  fill and nothing rests, so there's no per-iteration cleanup at all — the
+  maker is replenished (paused) once per ~10⁹ fills, i.e. effectively never.
+  The taker reuses one id, which is safe *because* it never rests (ids only
+  matter once an order enters the book).
+- **`BM_AddCancel_PoolVsMalloc`** — identical book operations on both arms;
+  the *only* difference is where the `Order` comes from (pool vs
+  `new`/`delete`). This isolates the allocator's contribution to a full
+  add+cancel round trip — the number that justifies Commit 2's existence.
+- **`BM_SyntheticStream`** — the headline: millions of generated messages
+  through `MatchingEngine::process`, mixing adds, cancels, market orders and
+  natural crossings. The engine is rebuilt fresh each iteration (paused) so
+  every replay starts from an empty book and unique ids. Cancel rate is set
+  to 0.35 to keep the resting population comfortably under the 1M-order
+  pool. The `fills_per_run` counter is reported so you can see the stream
+  actually matched (~585K fills per 1M messages) — a throughput number over
+  a stream that never crossed would be meaningless.
+
+### Ring buffer benchmark design (`ring_buffer_bench.cpp`)
+
+**The consumer thread persists across iterations.** The scaffold spawned a
+thread *per iteration*; thread creation is tens of microseconds, which would
+drown a microsecond-scale measurement for small batches. Instead one consumer
+is created before the timing loop and told to stop after it.
+
+**Measuring without distorting.** The producer must know when the consumer
+has received everything (otherwise an iteration would end while items are
+still in flight, under-measuring). But if the consumer bumped a shared atomic
+counter per item, that write would fight with the queue's own cache traffic
+and slow down the very thing being measured. Compromise: the consumer counts
+locally and *publishes* to the shared counter only every 1024 items or when
+the queue is momentarily empty. The fast path stays clean; the producer's
+end-of-iteration wait is exact.
+
+- **`BM_SPSC_PushPop_SingleThread`** — one thread, push+pop. No cross-core
+  traffic, so this is the pure instruction cost (~1ns) — the upper bound.
+- **`BM_SPSC_Throughput<T>`** — templated on payload: `uint64_t` (8B) vs
+  `EngineMessage` (the real 48B variant: a 40B `NewOrderMessage` + the
+  variant's type tag, padded). Run both and you see whether the
+  pipe's cost is per-item or per-byte. Note when reading results: batch
+  sizes that fit inside the ring (65K items ≈ ring capacity) include a
+  "drain tail" where only the consumer is working, so the *larger* batches
+  reflect steady-state overlap and are the honest throughput number.
+- **`BM_SPSC_RoundTrip`** — two queues, an echo thread, ping-pong. One
+  iteration = 2 pushes + 2 pops + 2 cross-core cache-line handoffs. This is
+  the latency-oriented view (~190ns round trip ⇒ ~95ns one-way), and the
+  closest proxy for "how long does a message take to reach the next thread"
+  in the real pipeline.
+
+### CMake: the warnings interface library
+
+Enabling benchmarks broke the build in an instructive way: our global
+`add_compile_options(-Wconversion -Wsign-conversion ...)` applied to *every*
+target in the build tree — including Google Benchmark's own sources, which
+compile with `-Werror`. Their code has (benign) sign conversions; our flags
+turned them into hard errors.
+
+The fix is the idiomatic modern-CMake pattern: an **INTERFACE library**
+(`engine_warnings`) that carries the flags as usage requirements. Targets
+that link it (all of *our* code) get the warnings; third-party code fetched
+via FetchContent builds with its own settings. An INTERFACE library compiles
+nothing itself — it's a named bundle of flags/includes/dependencies.
+
+Google Benchmark also gets the same treatment as GTest: `find_package` first
+(vcpkg/system), FetchContent download as fallback, so the project still
+builds with zero pre-installed dependencies. `BUILD_BENCHMARKS` and
+`BUILD_TOOLS` now default ON.
+
+### Linux toolchain note
+
+This machine had GCC 11 but no CMake, no make, no pip. Rather than touch the
+system, CMake 3.30 and Ninja binaries live in `.toolchain/` inside the repo
+(gitignored). Configure with:
+
+```bash
+export PATH="$PWD/.toolchain/cmake-3.30.5-linux-x86_64/bin:$PATH"
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_MAKE_PROGRAM=$PWD/.toolchain/ninja
+cmake --build build -j$(nproc)
+```
+
+### First (noisy) numbers — treat as smoke test only
+
+Measured on this machine with CPU frequency scaling ON and background load —
+real numbers for `docs/benchmarks.md` need a quiet machine, performance
+governor, and ideally core pinning:
+
+| Benchmark | Result |
+|---|---|
+| `BM_AddOrder` | ~11.5 ns |
+| `BM_CancelOrder` | ~39 ns |
+| `BM_MatchOrder` (1 fill) | ~8.3 ns |
+| Add+cancel, pool | ~19 ns |
+| Add+cancel, malloc | ~29 ns |
+| `BM_SyntheticStream` | ~22–25M msgs/sec through the full engine |
+| SPSC push+pop (1 thread) | ~1.2 ns |
+| SPSC round trip (2 threads) | ~188 ns |
+
+Already comfortably inside the plan's aspirational targets (sub-500ns add,
+sub-1µs match) — but the honest measurement happens in Phase 4 with `perf`
+on bare metal.
