@@ -286,3 +286,102 @@ order book operation drives the list through push/remove/pop cycles.
 Comment style cleanup across all files built so far: removed Doxygen `///`
 blocks, `@file`/`@brief`/`@param` tags, dash-row section banners, and trailing
 periods on comments. Comments now only say things the code can't.
+
+---
+
+## Commit 4 — Flat-Array Order Book (`order_book.h/.cpp`)
+
+### The core idea: price IS the array index
+
+The textbook order book is a `std::map<Price, Level>` (a red-black tree):
+O(log n) lookup, and every step of the tree walk is a pointer dereference to
+an unpredictable address — a likely cache miss. Our book is one flat array:
+
+```cpp
+levels_[price_in_ticks]   // THE lookup. One multiply-free index. O(1).
+```
+
+Since prices are already stored as tick counts, there is zero arithmetic on
+the hot path. The cost is memory: 10M levels × 24 bytes ≈ 240MB allocated once
+at startup. That trade — memory for deterministic O(1) access with no pointer
+chasing — is the central design decision of the whole engine. The alternative
+(a dynamic band of levels around the current price that re-centers when price
+moves out of range) was rejected because re-centering is an O(N) stop-the-world
+pause at exactly the worst moment: a fast market move.
+
+### One array shared by both sides — the "uncrossed book" invariant
+
+Bids and asks live in the same `levels_` array; a level doesn't know which
+side it belongs to. This works because a healthy book is **uncrossed**: every
+bid price < every ask price. The matching engine (Commit 6) guarantees this —
+an incoming order that would cross is *matched* against the opposite side
+until it no longer crosses, and only then rests. So any single level only ever
+contains one side's orders, and scanning down from the best bid can never run
+into an ask level. The invariant is documented in the header because the
+standalone `OrderBook` doesn't enforce it — its correctness depends on how the
+engine drives it.
+
+### Best bid/ask tracking: cheap adds, lazy repair on cancel
+
+- **Add**: one comparison. New bid above `best_bid_`? Update it. Done.
+- **Cancel that empties the best level**: scan inward (down for bids, up for
+  asks) until the next non-empty level. This is O(gap), but real liquidity
+  clusters tightly around the top of book, so the gap is nearly always a few
+  ticks.
+
+Two bugs in the scaffold version were fixed here:
+
+1. **`has_bids()`/`has_asks()` were wrong.** They checked whether the level at
+   `best_bid_`/`best_ask_` was non-empty. But the sentinel for "no asks" is
+   level `MAX_PRICE_TICKS - 1` — if a real order ever rested there, or if an
+   order of the *opposite* side sat at the sentinel price, the answer was
+   wrong. The book now keeps explicit `bid_count_`/`ask_count_` counters
+   (incremented on add, decremented on cancel), making the question exact.
+2. **Cancelling the last order on a side scanned up to 10M empty levels.**
+   The old rescan walked from the removed price all the way to the array edge
+   looking for a non-empty level that didn't exist. Now the rescan first checks
+   the side counter: if the side just became empty, reset the sentinel directly
+   and skip the scan entirely.
+
+### Fixed: the 240MB object
+
+The scaffold declared `std::array<PriceLevel, 10'000'000> levels_` as a plain
+member, which makes `sizeof(OrderBook)` ≈ 240MB — and `MatchingEngine` holds an
+`OrderBook` *by value*, so `MatchingEngine engine;` as a local variable would
+have overflowed the stack instantly. Same fix as the memory pool: the levels
+now live behind a `std::unique_ptr<PriceLevel[]>`, one heap allocation in the
+constructor. (`make_unique<T[]>(n)` also value-initializes every level, so all
+queues start empty — no separate zeroing pass needed.)
+
+### Cancel path and the OrderId map
+
+`cancel_order(id)` is: hash map lookup → intrusive unlink → counter/best
+repair. The `unordered_map<OrderId, Order*>` is `reserve`d to 100K buckets up
+front because rehashing moves every bucket — an unpredictable multi-microsecond
+stall if it happened mid-session. Noted as future work in the header: replace
+the hash map with a dense slot array indexed by order id + generation counters,
+which turns the lookup's hash-and-probe into a single array index.
+
+One ownership subtlety: `cancel_order` removes the order from the book's
+structures but does **not** free the `Order` — the book never allocates, so it
+never deallocates. The matching engine owns the pool and returns the slot after
+the cancel succeeds.
+
+### Test design notes (`order_book_test.cpp`)
+
+- Tests use a fixture (`TEST_F`) holding the book plus a `std::deque<Order>`
+  order arena. A deque (not a vector) because the book stores raw `Order*`
+  pointers: deque `push_back` never relocates existing elements, while a vector
+  reallocation would invalidate every pointer the book holds.
+- `CancelMiddleOrderPreservesFifo` asserts on the raw `prev`/`next` pointers to
+  prove the intrusive list rewires correctly around a removed node — this is
+  the direct PriceLevel coverage promised in Commit 3.
+- `CancelLastOrderOnSideResetsSentinel` pins down scaffold bug #1/#2 above:
+  with asks still resting, cancelling the only bid must flip `has_bids()` to
+  false via the counter, not by scanning.
+- `DeepBookCancelWalk` cancels the best bid 100 times in a row and checks the
+  best pointer walks down one level at a time — the lazy-repair scan under
+  sustained pressure.
+- Each test constructs its own book, i.e. a fresh 240MB allocation per test.
+  That's why the suite takes a few seconds — correctness tests prioritize
+  isolation over speed; the benchmarks (Commit 7) reuse one book.

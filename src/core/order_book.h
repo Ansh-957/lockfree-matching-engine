@@ -1,21 +1,23 @@
 #pragma once
 
-/// @file order_book.h
-/// @brief Central limit order book with O(1) price level access.
-///
-/// The order book uses a flat array of PriceLevel objects indexed directly
-/// by price (in ticks). This gives O(1) lookup for any price level at the
-/// cost of a large up-front allocation (~240 MB for 10M levels × 24 bytes).
-///
-/// Best bid/ask tracking:
-///   - best_bid_ is the highest price with resting bid orders.
-///   - best_ask_ is the lowest price with resting ask orders.
-///   - These are updated lazily: on add, we only compare with the current best;
-///     on cancel/fill that empties a level, we scan to find the new best.
-///
-/// Order lookup by ID is done via an unordered_map for O(1) amortized cancels.
+// Central limit order book with O(1) price level access
+//
+// A single flat array of PriceLevels indexed directly by price in ticks:
+// levels_[p] is the order queue at p ticks. ~240MB allocated once at
+// startup buys O(1) lookup at any price with zero pointer chasing
+//
+// Bids and asks share the array. This relies on the book staying uncrossed
+// (best bid < best ask), which the matching engine guarantees by consuming
+// crossing volume before resting an order - so any given level only ever
+// holds one side. Per-side order counts make has_bids/has_asks exact and
+// let cancel skip the best-price rescan when a side just became empty
+//
+// Best bid/ask are updated lazily: adds compare against the current best;
+// a cancel that empties the best level scans inward for the next non-empty
+// level. Cancels cluster near the top of book, so the scan is short in
+// practice
 
-#include <array>
+#include <memory>
 #include <unordered_map>
 #include <cstdint>
 
@@ -25,97 +27,65 @@
 
 namespace engine {
 
-/// @brief A central limit order book supporting one symbol/instrument.
-///
-/// The book maintains a flat array of PriceLevels (one per tick) and tracks
-/// best bid/ask prices for efficient matching. Orders are stored in a
-/// separate MemoryPool and linked into the appropriate PriceLevel.
 class OrderBook {
 public:
     OrderBook();
     ~OrderBook() = default;
 
-    // Non-copyable, non-movable — contains a massive levels_ array.
+    // owns a huge buffer and hands out pointers into it
     OrderBook(const OrderBook&)            = delete;
     OrderBook& operator=(const OrderBook&) = delete;
     OrderBook(OrderBook&&)                 = delete;
     OrderBook& operator=(OrderBook&&)      = delete;
 
-    // -------------------------------------------------------------------
-    // Order management
-    // -------------------------------------------------------------------
-
-    /// @brief Add a resting order to the book at its price level.
-    /// @param order  Pointer to a fully constructed order. Must not already
-    ///               be in the book.
-    /// @return true on success, false if the order ID is a duplicate or
-    ///         the price is out of range.
+    // rest a fully constructed order at its price level
+    // returns false on duplicate id or out-of-range price
     bool add_order(Order* order);
 
-    /// @brief Cancel (remove) an order by its ID.
-    /// @param id  The order ID to cancel.
-    /// @return true if the order was found and removed, false if not found.
+    // remove an order by id; returns false if not found
+    // the caller still owns the Order memory and must deallocate it
     bool cancel_order(OrderId id);
 
-    /// @brief Look up an order by ID.
-    /// @return Pointer to the order, or nullptr if not found.
+    // nullptr if not found
     [[nodiscard]] Order* get_order(OrderId id) const;
 
-    // -------------------------------------------------------------------
-    // Price level access
-    // -------------------------------------------------------------------
-
-    /// @brief Get the price level at a specific tick price.
-    /// @pre 0 <= price < MAX_PRICE_TICKS
+    // valid for 0 <= price < MAX_PRICE_TICKS
     [[nodiscard]] const PriceLevel& get_level(Price price) const;
-
-    /// @brief Mutable access to a price level (used by matching engine).
-    /// @pre 0 <= price < MAX_PRICE_TICKS
     [[nodiscard]] PriceLevel& get_level_mut(Price price);
 
-    // -------------------------------------------------------------------
-    // Best price tracking
-    // -------------------------------------------------------------------
-
-    /// @brief Current best (highest) bid price, or 0 if no bids.
+    // sentinels when the side is empty (0 / MAX_PRICE_TICKS - 1);
+    // check has_bids()/has_asks() before trusting these
     [[nodiscard]] Price best_bid() const noexcept { return best_bid_; }
-
-    /// @brief Current best (lowest) ask price, or MAX_PRICE_TICKS - 1 if no asks.
     [[nodiscard]] Price best_ask() const noexcept { return best_ask_; }
 
-    /// @brief Spread in ticks between best ask and best bid.
-    /// @note Returns a potentially meaningless value if one side is empty.
+    // meaningless if either side is empty
     [[nodiscard]] Price spread() const noexcept { return best_ask_ - best_bid_; }
 
-    /// @brief Whether there are any bid orders in the book.
-    [[nodiscard]] bool has_bids() const noexcept;
+    [[nodiscard]] bool has_bids() const noexcept { return bid_count_ > 0; }
+    [[nodiscard]] bool has_asks() const noexcept { return ask_count_ > 0; }
 
-    /// @brief Whether there are any ask orders in the book.
-    [[nodiscard]] bool has_asks() const noexcept;
+    // resting order counts per side
+    [[nodiscard]] uint64_t bid_count() const noexcept { return bid_count_; }
+    [[nodiscard]] uint64_t ask_count() const noexcept { return ask_count_; }
 
 private:
-    // -------------------------------------------------------------------
-    // Best price maintenance helpers
-    // -------------------------------------------------------------------
     void update_best_bid_after_remove(Price removed_price);
     void update_best_ask_after_remove(Price removed_price);
 
-    // -------------------------------------------------------------------
-    // Data members
-    // -------------------------------------------------------------------
+    // heap-backed: 10M levels * 24 bytes would make sizeof(OrderBook) ~240MB
+    // if the array were an inline member, blowing the stack the moment
+    // anyone declares a book (or a MatchingEngine holding one) as a local
+    std::unique_ptr<PriceLevel[]> levels_;
 
-    /// Flat array of price levels, indexed by tick price.
-    /// levels_[p] is the queue of orders at price p ticks.
-    /// This is the "big array" approach: ~240 MB for 10M levels.
-    std::array<PriceLevel, MAX_PRICE_TICKS> levels_;
-
-    /// Best (highest) bid price. Initialized to 0 (no bids).
     Price best_bid_ = 0;
-
-    /// Best (lowest) ask price. Initialized to MAX_PRICE_TICKS - 1 (no asks).
     Price best_ask_ = MAX_PRICE_TICKS - 1;
 
-    /// Maps OrderId → Order* for O(1) cancel by ID.
+    uint64_t bid_count_ = 0;
+    uint64_t ask_count_ = 0;
+
+    // OrderId -> Order* for O(1) cancels; pre-sized to limit rehashing
+    // future work: dense slot array with generation counters to avoid
+    // hash map cache misses
     std::unordered_map<OrderId, Order*> order_map_;
 };
 

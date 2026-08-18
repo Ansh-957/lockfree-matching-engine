@@ -111,7 +111,7 @@ if(BUILD_TESTS)
 
     add_executable(unit_tests
         test/memory_pool_test.cpp
-        # test/order_book_test.cpp       # Commit 4
+        test/order_book_test.cpp
         # test/spsc_queue_test.cpp       # Commit 5
         # test/matching_engine_test.cpp  # Commit 6
         # test/feed_parser_test.cpp      # Commit 9
