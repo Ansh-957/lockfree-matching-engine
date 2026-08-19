@@ -34,6 +34,7 @@ public:
 
     [[nodiscard]] const FeedHandler& handler() const noexcept { return handler_; }
     [[nodiscard]] uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
+    [[nodiscard]] uint64_t pushed()  const noexcept { return pushed_.load(std::memory_order_relaxed); }
 
 private:
     std::string product_id_;
@@ -42,6 +43,7 @@ private:
     std::vector<EngineMessage> batch_;
     SPSCQueue<EngineMessage, FEED_QUEUE_SIZE>* queue_ = nullptr;
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<uint64_t> pushed_{0};
 };
 
 } // namespace engine

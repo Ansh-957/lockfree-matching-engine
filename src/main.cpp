@@ -1,206 +1,341 @@
-/// @file main.cpp
-/// @brief Entry point for the matching engine application.
-///
-/// Architecture overview:
-///   Thread 1 (Feed):   WebSocket → FeedHandler → SPSC Queue (producer)
-///   Thread 2 (Engine): SPSC Queue (consumer) → MatchingEngine → Output Queue
-///   Thread 3 (Output): Output Queue → TradeLogger, MetricsCollector
-///
-/// In synthetic mode, Thread 1 generates random orders instead of connecting
-/// to a live feed. This is used for benchmarking and testing.
+// Entry point: thread orchestration for the full pipeline
+//
+//   ingest (core 0)  CoinbaseFeed or synthetic generator -> SPSC #1
+//   engine (core 1)  SPSC #1 -> MatchingEngine -> SPSC #2
+//   output (core 2)  SPSC #2 -> trade tape + throughput stats
+//
+// Shutdown is staged in pipeline order so no queue is abandoned with a
+// producer still running:
+//   signal/duration -> stop ingest, join it
+//                   -> engine_stop; engine drains SPSC #1, joins
+//                   -> output_stop; output drains SPSC #2, joins
+//
+// The signal handler only sets an atomic flag: that is the whole list of
+// things a signal handler may safely do (iostream, malloc, locks are all
+// forbidden in signal context).
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <variant>
 
-// Core engine
-#include "core/types.h"
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "core/matching_engine.h"
-
-// Transport
-#include "transport/spsc_queue.h"
+#include "core/types.h"
+#include "feed/coinbase_feed.h"
+#include "feed/feed_handler.h"
+#include "tools/synthetic_workload.h"
 #include "transport/message.h"
-
-// Metrics
-#include "metrics/metrics_collector.h"
-#include "metrics/trade_logger.h"
-
-// Feed (Phase 3)
-// #include "feed/coinbase_feed.h"
-// #include "feed/feed_handler.h"
+#include "transport/spsc_queue.h"
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Version and banner
-// ---------------------------------------------------------------------------
+using namespace engine;
 
-constexpr const char* ENGINE_NAME    = "matching-engine";
-constexpr const char* ENGINE_VERSION = "0.1.0";
+// ---- shutdown flags ------------------------------------------------------
 
-void print_banner() {
-    std::cout << "\n";
-    std::cout << "  ╔══════════════════════════════════════════╗\n";
-    std::cout << "  ║         LOW-LATENCY MATCHING ENGINE      ║\n";
-    std::cout << "  ║              v" << ENGINE_VERSION << "                       ║\n";
-    std::cout << "  ╚══════════════════════════════════════════╝\n";
-    std::cout << "\n";
+std::atomic<bool> g_shutdown{false};   // set by SIGINT/SIGTERM or --duration
+
+void signal_handler(int) {
+    g_shutdown.store(true, std::memory_order_release);
 }
 
-// ---------------------------------------------------------------------------
-// Signal handling
-// ---------------------------------------------------------------------------
+// ---- CPU affinity --------------------------------------------------------
 
-/// Global flag for clean shutdown. Set to false by the signal handler.
-std::atomic<bool> g_running{true};
-
-void signal_handler(int signum) {
-    std::cout << "\n[SIGNAL] Received signal " << signum << ", shutting down...\n";
-    g_running.store(false, std::memory_order_release);
+// Pinning a thread to one core keeps its working set in that core's L1/L2
+// and stops the scheduler from migrating it mid-burst. Best effort: on
+// failure (fewer cores, no permission) the thread simply runs unpinned.
+bool pin_to_core(unsigned core) {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    return pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0;
+#else
+    (void)core;
+    return false;
+#endif
 }
 
-void install_signal_handlers() {
-    std::signal(SIGINT,  signal_handler);
-    std::signal(SIGTERM, signal_handler);
+// SCHED_FIFO means "run until you block or a higher-priority RT task
+// preempts you" - no timeslice round-robin against normal processes.
+// Requires root (or CAP_SYS_NICE); silently degrades to normal scheduling.
+bool try_realtime_priority() {
+#if defined(__linux__)
+    sched_param param{};
+    param.sched_priority = 80;
+    return pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == 0;
+#else
+    return false;
+#endif
 }
 
-// ---------------------------------------------------------------------------
-// Command-line parsing
-// ---------------------------------------------------------------------------
+// polite busy-wait: PAUSE tells the CPU this is a spin loop (saves power,
+// yields pipeline resources to the sibling hyperthread)
+inline void cpu_relax() {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
 
-enum class RunMode {
-    Synthetic,  ///< Generate synthetic orders for benchmarking
-    Live        ///< Connect to live exchange feed (Phase 3)
+// ---- cross-thread counters (stats only, all relaxed) ----------------------
+
+struct Counters {
+    std::atomic<uint64_t> ingested{0};    // synthetic mode: pushed into SPSC #1
+    std::atomic<uint64_t> processed{0};   // messages through the engine
+    std::atomic<uint64_t> fills{0};       // fills emitted
+    std::atomic<uint64_t> out_dropped{0}; // SPSC #2 full
+    std::atomic<uint64_t> pool_free{0};   // published by the engine thread
 };
 
+// ---- config ----------------------------------------------------------------
+
 struct Config {
-    RunMode mode = RunMode::Synthetic;
+    bool        live       = true;
+    std::string product    = "BTC-USD";
+    unsigned    duration_s = 0;   // 0 = run until Ctrl+C
 };
 
 Config parse_args(int argc, char* argv[]) {
-    Config config;
-
+    Config cfg;
     for (int i = 1; i < argc; ++i) {
-        std::string_view arg{argv[i]};
-
-        if (arg == "--synthetic" || arg == "-s") {
-            config.mode = RunMode::Synthetic;
-        } else if (arg == "--live" || arg == "-l") {
-            config.mode = RunMode::Live;
+        const std::string_view arg{argv[i]};
+        if (arg == "--live" || arg == "-l") {
+            cfg.live = true;
+        } else if (arg == "--synthetic" || arg == "-s") {
+            cfg.live = false;
+        } else if (arg == "--product" && i + 1 < argc) {
+            cfg.product = argv[++i];
+        } else if (arg == "--duration" && i + 1 < argc) {
+            cfg.duration_s = static_cast<unsigned>(std::atoi(argv[++i]));
         } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: " << argv[0] << " [OPTIONS]\n"
-                      << "\n"
-                      << "Options:\n"
-                      << "  --synthetic, -s    Run with synthetic order data (default)\n"
-                      << "  --live, -l         Connect to live exchange feed (Phase 3)\n"
-                      << "  --help, -h         Show this help message\n";
+            std::cout << "Usage: matching-engine [--live|--synthetic] "
+                         "[--product BTC-USD] [--duration seconds]\n";
             std::exit(0);
         } else {
-            std::cerr << "Unknown argument: " << arg << "\n";
-            std::cerr << "Use --help for usage information.\n";
+            std::cerr << "Unknown argument: " << arg << " (see --help)\n";
             std::exit(1);
         }
     }
-
-    return config;
+    return cfg;
 }
 
-} // anonymous namespace
+using InputQueue  = SPSCQueue<EngineMessage, FEED_QUEUE_SIZE>;
+using OutputQueue = SPSCQueue<OutputMessage, FEED_QUEUE_SIZE>;
 
-// ===========================================================================
-// main
-// ===========================================================================
+// ---- threads ---------------------------------------------------------------
+
+// synthetic ingest: same generator the benchmarks use, throttled only by
+// queue capacity - a local full-pipeline load test with zero network
+void run_synthetic_ingest(InputQueue& in, Counters& c) {
+    synth::WorkloadConfig wcfg;
+    wcfg.cancel_rate = 0.35;
+    synth::WorkloadGenerator gen(wcfg);
+
+    while (!g_shutdown.load(std::memory_order_acquire)) {
+        const EngineMessage msg = gen.next();
+        while (!in.try_push(msg)) {
+            if (g_shutdown.load(std::memory_order_acquire)) return;
+            cpu_relax();  // backpressure: wait instead of dropping
+        }
+        c.ingested.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void run_engine(InputQueue& in, OutputQueue& out, Counters& c,
+                const std::atomic<bool>& stop) {
+    MatchingEngine eng;
+    c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
+
+    EngineMessage msg;
+    uint64_t since_publish = 0;
+
+    while (true) {
+        if (in.try_pop(msg)) {
+            const auto& fills = eng.process(msg);
+            for (const Fill& f : fills) {
+                if (out.try_push(OutputMessage{f})) {
+                    c.fills.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    c.out_dropped.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            c.processed.fetch_add(1, std::memory_order_relaxed);
+
+            // pool_available() is engine-thread state; publish a snapshot
+            // occasionally instead of letting the stats thread race on it
+            if (++since_publish >= 1024) {
+                since_publish = 0;
+                c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
+            }
+        } else if (stop.load(std::memory_order_acquire)) {
+            break;  // producer joined AND queue drained
+        } else {
+            cpu_relax();
+        }
+    }
+    c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
+}
+
+// ingested_fn abstracts where the ingest count lives: the synthetic loop
+// bumps our counter, but the live feed counts pushes internally
+void run_output(OutputQueue& out, Counters& c, const std::atomic<bool>& stop,
+                const std::function<uint64_t()>& ingested_fn) {
+    using clock = std::chrono::steady_clock;
+    const auto start     = clock::now();
+    auto       next_stat = start + std::chrono::seconds(5);
+
+    uint64_t tape_printed = 0;
+    uint64_t last_ingested = 0;
+    OutputMessage msg;
+
+    const auto print_stats = [&] {
+        const auto now = clock::now();
+        const auto t   = std::chrono::duration_cast<std::chrono::seconds>(
+                             now - start).count();
+        const uint64_t ing  = ingested_fn();
+        const uint64_t rate = (ing - last_ingested) / 5;
+        last_ingested = ing;
+        std::cout << "[stats t=" << t << "s]"
+                  << " ingested=" << ing << " (" << rate << "/s)"
+                  << " processed=" << c.processed.load(std::memory_order_relaxed)
+                  << " fills=" << c.fills.load(std::memory_order_relaxed)
+                  << " dropped_out=" << c.out_dropped.load(std::memory_order_relaxed)
+                  << " pool_free=" << c.pool_free.load(std::memory_order_relaxed)
+                  << "\n";
+    };
+
+    while (true) {
+        if (out.try_pop(msg)) {
+            if (const auto* fill = std::get_if<FillMessage>(&msg)) {
+                // sample the tape: the first few fills prove the pipeline
+                // end to end; after that only 1-in-a-million (synthetic mode
+                // produces tens of millions of fills)
+                if (tape_printed < 5 || (tape_printed & ((1u << 20) - 1)) == 0) {
+                    std::cout << "[fill #" << tape_printed + 1 << "] "
+                              << "taker=" << fill->aggressive_id
+                              << " maker=" << fill->passive_id
+                              << " px=" << ticks_to_dollars(fill->price)
+                              << " qty=" << fill->quantity << "\n";
+                }
+                ++tape_printed;
+            }
+        } else if (stop.load(std::memory_order_acquire)) {
+            break;
+        } else {
+            if (clock::now() >= next_stat) {
+                print_stats();
+                next_stat += std::chrono::seconds(5);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    print_stats();
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
-    print_banner();
-    install_signal_handlers();
+    const Config cfg = parse_args(argc, argv);
 
-    const auto config = parse_args(argc, argv);
+    std::signal(SIGINT,  signal_handler);
+    std::signal(SIGTERM, signal_handler);
 
-    std::cout << "[INIT] Mode: "
-              << (config.mode == RunMode::Synthetic ? "synthetic" : "live")
+    std::cout << "matching-engine v0.1.0 | mode="
+              << (cfg.live ? "live" : "synthetic")
+              << (cfg.live ? " product=" + cfg.product : "")
+              << (cfg.duration_s ? " duration=" + std::to_string(cfg.duration_s) + "s"
+                                 : " (Ctrl+C to stop)")
               << "\n";
 
-    // TODO: Phase 1 — Initialize the matching engine.
-    //
-    //   engine::MatchingEngine engine;
-    //   std::cout << "[INIT] Order pool: " << engine.pool_available()
-    //             << " slots available\n";
+    InputQueue  input_queue;
+    OutputQueue output_queue;
+    Counters    counters;
 
-    // TODO: Phase 1 — Create SPSC queues for inter-thread communication.
-    //
-    //   using InputQueue  = engine::SPSCQueue<engine::EngineMessage, 65536>;
-    //   using OutputQueue = engine::SPSCQueue<engine::OutputMessage, 65536>;
-    //   InputQueue  input_queue;
-    //   OutputQueue output_queue;
+    std::atomic<bool> engine_stop{false};
+    std::atomic<bool> output_stop{false};
 
-    // TODO: Phase 2 — Initialize metrics and logging.
-    //
-    //   engine::MetricsCollector metrics;
-    //   engine::TradeLogger logger;
-    //   logger.open("trades.bin");
+    // live feed object outlives the ingest thread so main can stop() it
+    CoinbaseFeed feed{cfg.product};
 
-    // TODO: Phase 2 — Spawn engine thread.
-    //
-    //   std::thread engine_thread([&]() {
-    //       // Pin to core 1 for consistent latency:
-    //       //   SetThreadAffinityMask(GetCurrentThread(), 1 << 1);
-    //       //
-    //       // Engine loop:
-    //       //   while (g_running.load(std::memory_order_acquire)) {
-    //       //       engine::EngineMessage msg;
-    //       //       if (input_queue.try_pop(msg)) {
-    //       //           auto start = now_ns();
-    //       //           auto fills = std::visit(overloaded{
-    //       //               [&](const engine::NewOrderMessage& m) {
-    //       //                   return engine.process_new_order(m);
-    //       //               },
-    //       //               [&](const engine::CancelMessage& m) -> std::vector<engine::Fill> {
-    //       //                   engine.process_cancel(m);
-    //       //                   return {};
-    //       //               }
-    //       //           }, msg);
-    //       //           auto elapsed = now_ns() - start;
-    //       //           metrics.record_match_latency(elapsed);
-    //       //       }
-    //       //   }
-    //   });
+    // ---- ingest thread (core 0): produces into SPSC #1 ----
+    std::thread ingest([&] {
+        pin_to_core(0);
+        if (cfg.live) {
+            feed.start(input_queue);  // blocks in the Asio loop
+        } else {
+            run_synthetic_ingest(input_queue, counters);
+        }
+    });
 
-    // TODO: Phase 2 — Spawn feed thread (synthetic or live).
-    //
-    //   if (config.mode == RunMode::Synthetic) {
-    //       // Generate random orders and push into input_queue
-    //   } else {
-    //       // Phase 3: Start CoinbaseFeed
-    //   }
+    // ---- engine thread (core 1): the hot path ----
+    std::thread engine_thread([&] {
+        pin_to_core(1);
+        if (try_realtime_priority()) {
+            std::cout << "[init] engine thread: SCHED_FIFO acquired\n";
+        }
+        run_engine(input_queue, output_queue, counters, engine_stop);
+    });
 
-    // TODO: Phase 2 — Spawn output thread.
-    //
-    //   std::thread output_thread([&]() {
-    //       // Pin to core 2
-    //       // Drain output_queue, log fills, update metrics
-    //   });
+    // ---- output thread (core 2): tape + stats ----
+    const std::function<uint64_t()> ingested_fn =
+        cfg.live
+            ? std::function<uint64_t()>([&feed] { return feed.pushed(); })
+            : std::function<uint64_t()>([&counters] {
+                  return counters.ingested.load(std::memory_order_relaxed);
+              });
+    std::thread output_thread([&] {
+        pin_to_core(2);
+        run_output(output_queue, counters, output_stop, ingested_fn);
+    });
 
-    std::cout << "[INIT] Matching engine starting...\n";
-    std::cout << "[INIT] Press Ctrl+C to stop.\n";
+    // ---- main thread: wait for signal or deadline ----
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::seconds(cfg.duration_s);
+    while (!g_shutdown.load(std::memory_order_acquire)) {
+        if (cfg.duration_s != 0 && std::chrono::steady_clock::now() >= deadline) {
+            g_shutdown.store(true, std::memory_order_release);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 
-    // TODO: Replace this with the actual main loop / thread join.
-    // For now, just wait for shutdown signal.
-    // while (g_running.load(std::memory_order_acquire)) {
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    // }
+    // ---- staged shutdown, upstream first ----
+    std::cout << "[shutdown] stopping ingest...\n";
+    if (cfg.live) {
+        feed.stop();          // posts a websocket close; run() returns
+    }
+    ingest.join();            // synthetic loop watches g_shutdown itself
 
-    std::cout << "[SHUTDOWN] Matching engine stopped cleanly.\n";
+    engine_stop.store(true, std::memory_order_release);
+    engine_thread.join();     // drains SPSC #1, then exits
 
-    // TODO: Phase 2 — Join threads, flush logs, print final metrics.
-    //   engine_thread.join();
-    //   output_thread.join();
-    //   logger.flush();
-    //   logger.close();
-    //   std::cout << metrics.summary();
+    output_stop.store(true, std::memory_order_release);
+    output_thread.join();     // drains SPSC #2, prints final stats
 
+    if (cfg.live) {
+        std::cout << "[shutdown] feed: live_levels=" << feed.handler().live_levels()
+                  << " malformed=" << feed.handler().malformed_count()
+                  << " skipped=" << feed.handler().skipped_count()
+                  << " seq_gaps=" << feed.handler().sequence_gaps()
+                  << " feed_dropped=" << feed.dropped() << "\n";
+    }
+    std::cout << "[shutdown] clean exit\n";
     return 0;
 }

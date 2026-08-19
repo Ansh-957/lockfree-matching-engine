@@ -106,12 +106,21 @@ if(BUILD_FEED)
     add_executable(feed-smoke tools/feed_smoke.cpp)
     target_link_libraries(feed-smoke PRIVATE engine_feed engine_warnings)
 
-    # Commit 10/11: main executable + metrics library
+    # Commit 10: the full pipeline (ingest -> engine -> output)
+    add_executable(matching-engine src/main.cpp)
+    # CMAKE_SOURCE_DIR so synthetic mode can include "tools/synthetic_workload.h"
+    target_include_directories(matching-engine PRIVATE ${CMAKE_SOURCE_DIR})
+    target_link_libraries(matching-engine PRIVATE
+        engine_feed
+        engine_warnings
+        Threads::Threads
+    )
+
+    # Commit 11: metrics library
     # add_library(engine_metrics
     #     src/metrics/metrics_collector.cpp
     #     src/metrics/trade_logger.cpp
     # )
-    # add_executable(matching-engine src/main.cpp)
 endif()
 
 # Tools - Phase 2 (Commit 7)

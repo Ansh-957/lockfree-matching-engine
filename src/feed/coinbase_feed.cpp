@@ -26,7 +26,9 @@ void CoinbaseFeed::start(SPSCQueue<EngineMessage, FEED_QUEUE_SIZE>& queue) {
         batch_.clear();
         handler_.parse(raw, batch_);
         for (const auto& msg : batch_) {
-            if (!queue_->try_push(msg)) {
+            if (queue_->try_push(msg)) {
+                pushed_.fetch_add(1, std::memory_order_relaxed);
+            } else {
                 dropped_.fetch_add(1, std::memory_order_relaxed);
             }
         }

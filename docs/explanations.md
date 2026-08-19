@@ -1147,3 +1147,143 @@ requires `BUILD_FEED=ON`. Same FetchContent fallback as GTest/Benchmark.
 ./build/unit_tests --gtest_filter='FeedParserTest.*'   # 12 tests, no network
 ./build/feed-smoke 20                                  # live L2 → EngineMessages
 ```
+
+---
+
+## Commit 10 — Thread Orchestration (`main.cpp`)
+
+This commit turns the parts into a running program. `matching-engine` boots
+three threads, wires them together with the two SPSC queues, streams live
+Coinbase data through the matching engine, and shuts down in a controlled
+order on Ctrl+C or a `--duration` deadline.
+
+```
+ingest (core 0)   CoinbaseFeed  ──►  SPSC #1 (EngineMessage)
+engine (core 1)   SPSC #1 ──► MatchingEngine ──► SPSC #2 (OutputMessage)
+output (core 2)   SPSC #2 ──► fill tape + 5-second stats lines
+```
+
+### Why exactly three threads, and why these three
+
+The SPSC queues are **single**-producer/**single**-consumer: their whole
+lock-free correctness argument rests on only one thread ever writing the
+head index and only one ever writing the tail. So the thread topology is
+not a tuning choice — it is dictated by the transport. Queue #1 has the
+ingest thread as its only producer and the engine thread as its only
+consumer; queue #2 has the engine as producer and the output thread as
+consumer. Adding a fourth participant to either queue would break the
+memory-ordering contract.
+
+It also keeps the matching engine single-threaded (the "single-writer
+principle" from Commit 6): the engine thread owns the book and the pool
+exclusively, so the hot path needs no locks at all.
+
+### CPU pinning (`pthread_setaffinity_np`)
+
+By default Linux migrates threads between cores whenever the scheduler
+feels like it. Each migration invalidates the thread's L1/L2 cache working
+set — for the engine thread that's the top of the book, the pool free
+list, and the queue indices, i.e. exactly the data whose cache residency
+we spent Commits 2–5 engineering. Pinning each thread to a fixed core
+(`CPU_ZERO`/`CPU_SET` + `pthread_setaffinity_np`) makes migrations
+impossible and, as a bonus, stops the two queue endpoints from ping-ponging
+onto the same core.
+
+Pinning is best-effort: on a machine with fewer than 3 cores, or without
+permission, the call fails and the thread simply runs unpinned. Same for
+`SCHED_FIFO` real-time priority on the engine thread: it means "never
+timeslice this thread against normal processes", but it needs root
+(CAP_SYS_NICE), so we attempt it and silently degrade.
+
+### Signal handling: the handler does one thing
+
+A signal handler interrupts the program at an arbitrary instruction. Only
+async-signal-safe operations are legal inside it — no `iostream`, no
+`malloc`, no mutexes (the interrupted thread might hold the lock the
+handler would then try to take → self-deadlock). The entire handler is:
+
+```cpp
+void signal_handler(int) { g_shutdown.store(true, std::memory_order_release); }
+```
+
+The main thread polls that flag every 50 ms and performs the actual
+shutdown from normal context. (The scaffold's original handler printed to
+`cout` — that was a latent bug, now removed.)
+
+### Staged shutdown: drain in pipeline order
+
+Killing all threads at once loses messages and can leave a queue with a
+producer writing into it after its consumer died. Instead each stage stops
+only after the stage upstream of it has fully stopped:
+
+1. `feed.stop()` posts a WebSocket close onto the Asio loop; `start()`
+   returns and the **ingest** thread joins. Nothing produces into queue #1
+   anymore.
+2. Main sets `engine_stop`. The **engine** loop's exit condition is
+   `try_pop failed AND engine_stop` — so it first drains everything still
+   sitting in queue #1, then exits, then joins.
+3. Main sets `output_stop`. Same drain-then-exit for the **output**
+   thread, which prints the final stats line on its way out.
+
+Three separate flags (`g_shutdown`, `engine_stop`, `output_stop`) rather
+than one, because the stages must observe the stop at *different times*.
+If the engine watched `g_shutdown` directly it could exit while the feed
+was still pushing, stranding messages.
+
+### The spin-wait: `_mm_pause()`
+
+When the engine finds queue #1 empty it does not sleep — waking from even
+the shortest sleep costs microseconds, which would dominate our
+sub-microsecond match latency. It busy-spins, executing the x86 `PAUSE`
+instruction each iteration. `PAUSE` hints to the CPU "this is a spin
+loop": it stops speculative memory-order violations from flushing the
+pipeline and yields execution resources to the sibling hyperthread. The
+output thread, by contrast, sleeps 1 ms between polls — it prints stats;
+latency there is irrelevant, so burning a core would be waste.
+
+### Stats without racing on engine state
+
+The stats printer runs on the output thread, but numbers like
+`pool_available()` belong to the engine thread. Reading them cross-thread
+would be a data race. So every 1024 processed messages the engine
+*publishes* a snapshot into an atomic counter; the stats thread reads only
+atomics (relaxed order — they are monitoring numbers, not synchronization).
+Same idea for the live feed: `CoinbaseFeed` now counts successful pushes
+(`pushed()`) alongside drops, and `main` hands the output thread a small
+function that reads from whichever source matches the mode.
+
+### Two modes
+
+- `--live` (default): the ingest thread runs `CoinbaseFeed::start()`,
+  which blocks in the Asio event loop. Fills appear when the reconstructed
+  L2 book *transiently crosses* — e.g. a bid update arrives one frame
+  before the matching ask update — which is an expected artifact of
+  feeding L2 deltas into a matching engine, and a nice end-to-end proof.
+- `--synthetic`: the ingest thread runs the same `WorkloadGenerator` the
+  benchmarks use, throttled only by queue capacity (it spins on
+  backpressure instead of dropping). This is a full-pipeline load test
+  with zero network.
+
+### Measured results (this machine, sanitizers off, -O2)
+
+- Synthetic: **~5.9M messages/s sustained** through the full
+  ingest → match → output pipeline, ~35M fills in 11 s, zero drops.
+- Live BTC-USD: ~54k messages in 25 s, 102 fills, zero drops,
+  zero malformed frames, clean staged shutdown.
+
+One observation from the synthetic run: after tens of millions of
+messages `pool_free` hits ~0 — resting limit orders far from the touch
+accumulate faster than cancels/fills remove them, eventually exhausting
+the 1M-order pool. The engine degrades exactly as designed (Commit 6):
+an allocation failure drops the resting residual instead of crashing.
+A production system would size the pool for its instrument's real order
+lifetime distribution; for the synthetic stress test the graceful
+degradation is the point.
+
+### How to verify
+
+```bash
+./build/matching-engine --synthetic --duration 10   # local load test
+./build/matching-engine --live --duration 25        # live Coinbase pipeline
+./build/matching-engine                             # live until Ctrl+C
+```
