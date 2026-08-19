@@ -998,3 +998,152 @@ cmake --build build --target ws-smoke
 connects with increasing delay, then `stop()`. That exercises the path
 the earlier live handshake never hit (resolve/connect failure → timer →
 retry) without needing to yank a network cable.
+
+---
+
+## Commit 9 — SIMD JSON → Engine Messages (`feed_handler`, `coinbase_feed`)
+
+Two classes, two jobs:
+
+| Class | Knows about | Does not know about |
+|---|---|---|
+| `FeedHandler` | Coinbase JSON, ticks, lots, synthetic order ids | sockets, Boost, the SPSC queue |
+| `CoinbaseFeed` | `WebSocketClient`, the subscribe JSON, `try_push` | JSON field names |
+
+The split is load-bearing: the parser tests run with **no TLS, no Boost, no
+network**. They feed strings in and check `EngineMessage`s out. `CoinbaseFeed`
+is the thin live adapter — connect handler sends the subscribe
+(`level2_batch` + `matches`; Coinbase Exchange's plain `level2` now
+requires auth), message handler parses and pushes.
+
+### Why simdjson (and why the DOM API, not ondemand)
+
+Generic JSON libraries (`nlohmann::json`) parse by allocating a tree of
+heap objects: every key, every array element, another `new`. A Coinbase
+L2 snapshot is thousands of `[price, size]` pairs arriving in one frame.
+That allocator traffic on the ingest thread is the opposite of what we
+want.
+
+**simdjson** parses JSON with SIMD instructions (AVX2 on this machine).
+It does a first pass that validates UTF-8 and finds structural characters
+(`{ } [ ] , :`) 32–64 bytes at a time, then a second pass that walks those
+indexes. Throughput is on the order of GB/s — a 200KB snapshot is
+microseconds, not milliseconds.
+
+It has two front-ends:
+
+- **ondemand** — truly "zero copy": you iterate the input once, forward
+  only, and `string_view`s point into the original buffer. Fastest, but
+  `obj["sequence"]` when the field is *missing* scans to the end of the
+  object and leaves the cursor there, so a later `obj["changes"]` fails.
+  Coinbase's field order is not a contract, and `sequence` is optional on
+  L2 frames. ondemand fights that.
+- **DOM** — still SIMD-validated, still one arena allocation per document,
+  but you can look up fields in any order. We use this. The commit title
+  says "zero-copy"; the honest version is "zero per-field heap allocation,
+  one padded copy of the frame."
+
+### The padding copy
+
+simdjson's SIMD loops read **64 bytes past the end** of the JSON
+(`SIMDJSON_PADDING`). A WebSocket `string_view` does not have those 64
+bytes — reading them would be a buffer over-read. So every frame is copied
+into a reusable `std::string` with 64 zeros appended. After the first
+snapshot that string's capacity sticks; incremental `l2update`s do not
+allocate. This is the ingest thread, not the matching hot path, but it is
+still not a `malloc` per field.
+
+### L2 is not an order stream — cancel-replace
+
+Coinbase `level2` says "the quantity at this price is now Q", not "order
+X arrived." Our engine only understands `NewOrderMessage` / `CancelMessage`.
+The mapping:
+
+```
+one synthetic limit order per (side, price)
+Q > 0, no order yet     → NewOrder
+Q > 0, order exists     → Cancel old, NewOrder with new qty
+Q = 0                   → Cancel (level gone)
+snapshot                → Cancel *everything* we are tracking, then NewOrder
+                          for each level in the snapshot
+```
+
+That last rule is why a reconnect (Commit 8 re-sends subscribe, Coinbase
+sends a fresh snapshot) rebuilds a consistent book instead of layering a
+new snapshot on top of a stale one.
+
+We lose intra-level time priority — L2 never gave it to us. The engine
+still FIFO-queues the one synthetic order at that price, which is enough
+to keep the book uncrossed and to match against live depth.
+
+### Lots: fractional BTC in a `uint32_t`
+
+`Quantity` is an integer. Coinbase sizes look like `"0.45054140"`. At the
+system boundary we scale:
+
+```
+1 quantity unit = 1e-6 coin     (LOTS_PER_COIN = 1,000,000)
+1.5 BTC → 1,500,000
+```
+
+`uint32` max is ~4294 coins at this scale, which is more than any single
+BTC-USD L2 level. Prices still go through `dollars_to_ticks` ($0.01).
+Both conversions use `std::from_chars` (no locale, no exceptions). A
+price outside the book's `$0–$100k` array is **skipped** (the live BTC
+book has asks well above $100k) — that is not malformed JSON, so it
+does not increment `malformed_count()`.
+
+### Why `match` frames do not become orders
+
+A `match` is a trade Coinbase *already executed*. The corresponding size
+change also arrives as an `l2update`. Pushing a synthetic aggressor for
+the match would apply the same trade twice. Matches are used for
+**sequence tracking** (they carry a `sequence` number; L2 frames often
+do not) and then ignored. Fills in *our* engine are an output of matching,
+not an input from the feed.
+
+### Sequence gaps
+
+If a frame has `"sequence": N` and we last saw `M`, anything other than
+`N == M + 1` increments `sequence_gaps()`. We do **not** crash, and we
+do **not** drop the frame — a gap is information, not a reason to take
+the ingest thread down. Recovery is the reconnect path: `stop` is not
+required; CoinbaseFeed re-subscribes on every connect, which yields a
+new snapshot and `reset_book`. The test injects match frames with
+sequences 10 then 12 and asserts the counter.
+
+### Malformed JSON
+
+`parse()` is `noexcept` in spirit: simdjson error-code API, no exceptions.
+Garbage (`{`, `null`, `"buy","abc"`) returns 0 messages, increments
+`malformed_count()`, and leaves the synthetic book untouched. The
+matching engine never sees a partial order from a truncated frame.
+
+### `parse()` returns a count, not `optional<EngineMessage>`
+
+The scaffold returned one optional. A snapshot is thousands of levels;
+an `l2update` can carry several changes; a replace is two messages
+(cancel + new). One frame → many messages, so the API is:
+
+```
+size_t parse(string_view json, vector<EngineMessage>& out);
+```
+
+`CoinbaseFeed` reuses one `vector` (reserved to 4096): `clear()` keeps
+capacity, then `try_push` each message. If the SPSC is full the message
+is dropped and `dropped()` counts it — never blocks the ingest thread
+(a block here would stall the Asio event loop and delay every subsequent
+frame).
+
+### CMake: parser is not tied to `BUILD_FEED`
+
+`engine_feed_parse` (just `feed_handler.cpp` + simdjson) builds whenever
+tests or the feed are on. `engine_feed` (WebSocket + `CoinbaseFeed`) still
+requires `BUILD_FEED=ON`. Same FetchContent fallback as GTest/Benchmark.
+
+### How to verify
+
+```bash
+./build/unit_tests --gtest_filter='FeedParserTest.*'   # 12 tests, no network
+./build/feed-smoke 20                                  # live L2 → EngineMessages
+```

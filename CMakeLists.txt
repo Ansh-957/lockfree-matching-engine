@@ -51,6 +51,34 @@ target_include_directories(engine_core PUBLIC
 )
 target_link_libraries(engine_core PRIVATE engine_warnings)
 
+# simdjson: the feed parser. Tests need it even when BUILD_FEED is OFF so
+# parser correctness does not depend on Boost/OpenSSL/a live network.
+if(BUILD_TESTS OR BUILD_FEED)
+    find_package(simdjson CONFIG QUIET)
+    if(NOT simdjson_FOUND)
+        include(FetchContent)
+        set(SIMDJSON_JUST_LIBRARY ON CACHE INTERNAL "")
+        set(SIMDJSON_ENABLE_THREADS OFF CACHE INTERNAL "")
+        FetchContent_Declare(
+            simdjson
+            URL https://github.com/simdjson/simdjson/archive/refs/tags/v3.10.1.zip
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(simdjson)
+    endif()
+
+    add_library(engine_feed_parse src/feed/feed_handler.cpp)
+    target_include_directories(engine_feed_parse PUBLIC ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(engine_feed_parse PUBLIC engine_core simdjson::simdjson)
+    target_link_libraries(engine_feed_parse PRIVATE engine_warnings)
+    # simdjson headers trip -Wsign-conversion under our flags; treat them
+    # as system headers so we only lint our own parser code
+    get_target_property(_simd_inc simdjson::simdjson INTERFACE_INCLUDE_DIRECTORIES)
+    if(_simd_inc)
+        target_include_directories(engine_feed_parse SYSTEM PRIVATE ${_simd_inc})
+    endif()
+endif()
+
 # Feed library - Phase 3, built commit by commit
 if(BUILD_FEED)
     # Beast/Asio are header-only; OpenSSL provides the TLS implementation
@@ -60,22 +88,23 @@ if(BUILD_FEED)
 
     add_library(engine_feed
         src/feed/ws_client.cpp
-        # src/feed/coinbase_feed.cpp     # Commit 9 (needs simdjson)
-        # src/feed/feed_handler.cpp      # Commit 9
+        src/feed/coinbase_feed.cpp
     )
     target_include_directories(engine_feed PUBLIC ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(engine_feed PRIVATE engine_warnings)
     target_link_libraries(engine_feed PUBLIC
-        engine_core
+        engine_feed_parse
         Boost::headers
         OpenSSL::SSL
         OpenSSL::Crypto
         Threads::Threads
     )
 
-    # Commit 8 verification: live handshake against the Coinbase feed
     add_executable(ws-smoke tools/ws_client_smoke.cpp)
     target_link_libraries(ws-smoke PRIVATE engine_feed engine_warnings)
+
+    add_executable(feed-smoke tools/feed_smoke.cpp)
+    target_link_libraries(feed-smoke PRIVATE engine_feed engine_warnings)
 
     # Commit 10/11: main executable + metrics library
     # add_library(engine_metrics
@@ -115,11 +144,12 @@ if(BUILD_TESTS)
         test/order_book_test.cpp
         test/spsc_queue_test.cpp
         test/matching_engine_test.cpp
-        # test/feed_parser_test.cpp      # Commit 9
+        test/feed_parser_test.cpp
     )
 
     target_link_libraries(unit_tests PRIVATE
         engine_core
+        engine_feed_parse
         engine_warnings
         GTest::gtest
         GTest::gtest_main
