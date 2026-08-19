@@ -1287,3 +1287,147 @@ degradation is the point.
 ./build/matching-engine --live --duration 25        # live Coinbase pipeline
 ./build/matching-engine                             # live until Ctrl+C
 ```
+
+---
+
+## Commit 11 — Non-Blocking Telemetry (`latency_tracker.h`, `tsc_clock.h`, `metrics_collector`, `trade_logger`)
+
+The engine now measures itself: per-message match latency and end-to-end
+order latency, aggregated into HDR-style histograms on the metrics thread,
+plus an append-only binary log of every fill. The design constraint that
+shapes everything here: **the hot path must not pay for its own
+observation** (beyond the unavoidable clock reads).
+
+### The observer problem, and the ring-buffer answer
+
+The naive approach — engine thread calls `histogram.record(ns)` — puts
+histogram arithmetic, a possibly-cold 18KB bin array, and (if the reporter
+reads concurrently) shared cache-line traffic into the measured path. The
+measurement would distort the thing being measured.
+
+Instead the engine thread does the absolute minimum: read the clock twice,
+push a 16-byte `{kind, ns}` sample onto a third SPSC ring (engine →
+metrics thread), and move on. All binning, percentile math, and printing
+happens on the metrics thread, which was previously mostly idle. If the
+sample ring is ever full the sample is **dropped and counted** — losing a
+telemetry point costs nothing, making the matching loop wait would cost
+exactly the tail latency we are trying to measure.
+
+This is the same single-writer discipline as the rest of the pipeline:
+three SPSC rings now — orders in, fills out, telemetry out.
+
+### Reading the clock: RDTSC (`tsc_clock.h`)
+
+`std::chrono::steady_clock` resolves to `clock_gettime(CLOCK_MONOTONIC)`
+— ~20–25ns per call even via the vDSO. Two calls per message at ~4M
+msgs/s is a ~25% throughput tax. The x86 `RDTSC` instruction reads the
+Time Stamp Counter — a 64-bit register incrementing at a fixed frequency —
+in ~7ns, unprivileged.
+
+Two things make raw TSC usable as a nanosecond clock:
+
+1. **Invariant TSC**: on all x86 CPUs of the last ~15 years the counter
+   ticks at a constant rate regardless of turbo or sleep states, and the
+   kernel synchronizes it across cores.
+2. **Calibration**: no portable register reports the tick frequency, so at
+   startup we measure TSC ticks across a 20ms `steady_clock` interval and
+   derive ns-per-tick once (`tsc::calibrate()` — called explicitly in
+   `main` so the 20ms doesn't hide inside the first timed message).
+
+We deliberately do *not* fence around RDTSC (`RDTSCP`/`LFENCE`): the CPU
+may reorder it by a few ns against neighboring instructions, but for
+histogram telemetry that jitter is irrelevant and the serialization would
+cost more than it corrects. Non-x86 builds fall back to `steady_clock`.
+
+### The histogram: log-linear "HDR" buckets (`latency_tracker.h`)
+
+The scaffold's linear 1µs bins had a fatal flaw: match latency is
+~30–700ns, so **every sample would land in bin 0** and p50 = p99 = "under
+1µs". Useless. Linear 1ns bins over the full range (ns → ms) would need
+millions of bins. The resolution a percentile report actually needs is
+*relative*, not absolute: 100ns ± 2ns and 100µs ± 2µs are equally good.
+
+The HDR (High Dynamic Range) histogram delivers constant relative error:
+
+- Values 0–63 get exact 1ns buckets.
+- Above that, each power-of-two octave is split into 64 linear
+  sub-buckets, so every bucket is ≤ 1/64 ≈ 1.6% wide relative to its value.
+- Bucket index = one `bit_width()` (a single LZCNT instruction), a shift,
+  a subtract. O(1), branch-light, no allocation ever.
+- 2,368 buckets cover 1ns to ~73 minutes in 18.5KB.
+
+Percentile queries walk the buckets cumulatively — O(2368), done only at
+reporting time on the metrics thread. The tracker is deliberately **not**
+thread-safe: it is owned by one thread; atomics would reintroduce the
+cache traffic the ring buffer just removed.
+
+(A subtle test lesson: with exactly 0.1% slow samples, nearest-rank p99.9
+of 10,000 samples is the 9,990th — the *last fast one*. The histogram was
+right and the test was wrong; the tail fraction must exceed the percentile
+remainder for the tail to show.)
+
+### Two latencies, two stamps
+
+- **Match latency**: TSC read before and after `engine.process()`. Pure
+  engine work: book walk, fills, pool traffic.
+- **Order latency**: ingest stamps `msg.timestamp = tsc::now_ns()` when it
+  pushes (synthetic loop directly; `CoinbaseFeed` right after parsing), and
+  the engine subtracts at completion. This captures **queue wait + match**
+  — the number a trading system actually experiences.
+
+The two tell different stories, and the measured results show why you need
+both:
+
+| | match p50 | match p99 | order p50 |
+|---|---|---|---|
+| live BTC-USD | 28ns | 567ns | ~0.7ms |
+| synthetic saturation | 68ns | 775ns | ~18.6ms |
+
+- **Live order latency ~0.7ms** is not engine slowness: `level2_batch`
+  coalesces 50ms of updates per frame, so messages arrive in bursts all
+  stamped with one receive time; mid-burst messages queue behind their
+  siblings. The telemetry is correctly measuring burst drainage.
+- **Synthetic order latency ~18.6ms** is Little's law made visible: the
+  producer saturates the 64K-slot input ring and spins on backpressure, so
+  the ring is always full and every message waits 65,536 ÷ ~3.6M msgs/s ≈
+  18ms. Queue depth × service rate = wait time, to the digit.
+- Match latency stays sub-microsecond at p99 in both modes — the engine
+  itself does not degrade under load.
+
+Observer cost, measured honestly: synthetic throughput dropped from ~5.9M
+msgs/s (Commit 10, untimed) to ~3.6M msgs/s — that is the price of two
+clock reads and two ring pushes per message, and why the plan saves
+`perf stat` numbers for a dedicated profiling commit.
+
+### The trade logger (`trade_logger.cpp`)
+
+Append-only binary file of raw `FillMessage` bytes (trivially copyable, so
+`fwrite` of the struct **is** the serialization — no encode step). Details
+that matter:
+
+- **Header** (`"FILL"` + version + record size) lets a reader detect a
+  struct layout change instead of silently misparsing.
+- **1MB `setvbuf` buffer**: batches ~26K fills per `write()` syscall so the
+  metrics thread spends its time draining rings, not in the kernel.
+- **`"wb"` not `"ab"`**: the scaffold's append mode would write a second
+  header mid-file on every rerun, corrupting the format.
+- Runs on the metrics thread only — disk I/O never touches the hot path.
+
+Verified round-trip in tests: header + 100 records read back byte-exact,
+and the live run's file size matched 12 + n·40 bytes to the byte.
+
+### CMake
+
+`engine_metrics` (collector + logger; the histogram and clock are
+header-only) has zero external dependencies, so it sits next to
+`engine_core` and links into both `matching-engine` and `unit_tests`
+without requiring `BUILD_FEED`.
+
+### How to verify
+
+```bash
+./build/unit_tests --gtest_filter='LatencyTracker*:TradeLogger*:MetricsCollector*:TscClock*'
+./build/matching-engine --synthetic --duration 10   # summary prints at exit
+./build/matching-engine --live --duration 25        # match p99 ~ 600ns live
+xxd -l 16 trades.bin                                # FILL header + records
+```

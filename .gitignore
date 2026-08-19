@@ -30,3 +30,7 @@ results/*.json
 *.so
 *.dylib
 *.exe
+
+# runtime output
+trades.bin
+*.bin

@@ -3,41 +3,58 @@
 
 #include "metrics/trade_logger.h"
 
+#include <memory>
+#include <type_traits>
+
 namespace engine {
+
+namespace {
+// 1MB of stdio buffering: at sizeof(FillMessage)=40ish bytes that batches
+// ~26K fills per write() syscall instead of the default 4-8KB buffer.
+// The output thread is not latency-critical, but fewer syscalls means it
+// spends more time draining the queue and less time in the kernel.
+constexpr size_t FILE_BUFFER_SIZE = 1u << 20;
+} // namespace
 
 TradeLogger::~TradeLogger() {
     close();
 }
 
 bool TradeLogger::open(const std::string& filepath) {
-    // Open in binary append mode. Creates the file if it doesn't exist.
-    file_ = std::fopen(filepath.c_str(), "ab");
+    // "wb" (truncate), not "ab": each run produces one self-contained file.
+    // Appending would write a second header mid-file on the next run and
+    // corrupt the format for any reader.
+    file_ = std::fopen(filepath.c_str(), "wb");
     if (!file_) {
         return false;
     }
 
-    // Write a simple header/magic number so we can validate the file format later.
-    // Format: "FILL" (4 bytes) + version (uint32_t = 1) + record size (uint32_t).
-    constexpr char     magic[]     = "FILL";
-    constexpr uint32_t version     = 1;
-    constexpr uint32_t record_size = sizeof(FillMessage);
+    buffer_ = std::make_unique<char[]>(FILE_BUFFER_SIZE);
+    std::setvbuf(file_, buffer_.get(), _IOFBF, FILE_BUFFER_SIZE);
 
-    std::fwrite(magic, 1, 4, file_);
+    // Header: magic + version + record size. The record size lets a reader
+    // detect a FillMessage layout change instead of misparsing silently.
+    constexpr char     magic[4]    = {'F', 'I', 'L', 'L'};
+    constexpr uint32_t version     = 1;
+    constexpr auto     record_size = static_cast<uint32_t>(sizeof(FillMessage));
+
+    std::fwrite(magic, 1, sizeof(magic), file_);
     std::fwrite(&version, sizeof(version), 1, file_);
     std::fwrite(&record_size, sizeof(record_size), 1, file_);
 
+    total_logged_ = 0;
     return true;
 }
 
 void TradeLogger::log(const FillMessage& fill) {
     if (!file_) return;
 
-    // Write the fill as raw bytes. FillMessage is trivially copyable.
     static_assert(std::is_trivially_copyable_v<FillMessage>,
         "FillMessage must be trivially copyable for binary serialization");
 
-    std::fwrite(&fill, sizeof(FillMessage), 1, file_);
-    ++total_logged_;
+    if (std::fwrite(&fill, sizeof(FillMessage), 1, file_) == 1) {
+        ++total_logged_;
+    }
 }
 
 void TradeLogger::flush() {
@@ -52,6 +69,7 @@ void TradeLogger::close() {
         std::fclose(file_);
         file_ = nullptr;
     }
+    buffer_.reset();
 }
 
 } // namespace engine

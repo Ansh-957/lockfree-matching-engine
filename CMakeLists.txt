@@ -51,6 +51,16 @@ target_include_directories(engine_core PUBLIC
 )
 target_link_libraries(engine_core PRIVATE engine_warnings)
 
+# Metrics library (Commit 11) - HDR histogram, trade logger, TSC clock.
+# No external dependencies, so it lives next to engine_core and is usable
+# by tests without BUILD_FEED
+add_library(engine_metrics
+    src/metrics/metrics_collector.cpp
+    src/metrics/trade_logger.cpp
+)
+target_include_directories(engine_metrics PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(engine_metrics PRIVATE engine_warnings)
+
 # simdjson: the feed parser. Tests need it even when BUILD_FEED is OFF so
 # parser correctness does not depend on Boost/OpenSSL/a live network.
 if(BUILD_TESTS OR BUILD_FEED)
@@ -112,15 +122,10 @@ if(BUILD_FEED)
     target_include_directories(matching-engine PRIVATE ${CMAKE_SOURCE_DIR})
     target_link_libraries(matching-engine PRIVATE
         engine_feed
+        engine_metrics
         engine_warnings
         Threads::Threads
     )
-
-    # Commit 11: metrics library
-    # add_library(engine_metrics
-    #     src/metrics/metrics_collector.cpp
-    #     src/metrics/trade_logger.cpp
-    # )
 endif()
 
 # Tools - Phase 2 (Commit 7)
@@ -154,11 +159,13 @@ if(BUILD_TESTS)
         test/spsc_queue_test.cpp
         test/matching_engine_test.cpp
         test/feed_parser_test.cpp
+        test/metrics_test.cpp
     )
 
     target_link_libraries(unit_tests PRIVATE
         engine_core
         engine_feed_parse
+        engine_metrics
         engine_warnings
         GTest::gtest
         GTest::gtest_main

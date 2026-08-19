@@ -1,109 +1,121 @@
 #pragma once
 
-/// @file latency_tracker.h
-/// @brief Fixed-bin histogram for tracking latency distributions.
-///
-/// Provides O(1) recording and O(N_bins) percentile queries. Designed for
-/// nanosecond-granularity measurements in the matching engine hot path.
-///
-/// Bin layout:
-///   - Bins 0 through NUM_BINS-1 each cover 1 microsecond of latency.
-///   - Bin[i] counts samples with latency in [i*BIN_WIDTH_NS, (i+1)*BIN_WIDTH_NS).
-///   - Any sample >= NUM_BINS * BIN_WIDTH_NS goes into the overflow bin (last bin).
-///
-/// This gives coverage from 0 to 1ms at 1μs resolution (1000 bins),
-/// which is appropriate for sub-millisecond matching engine latencies.
+// HDR-style log-linear latency histogram.
+//
+// The problem with linear bins: match latency spans ~100ns to (rarely)
+// milliseconds - four orders of magnitude. Linear 1us bins would dump every
+// normal sample into bin 0 and report p50 == p99 == "under 1us", which is
+// useless. Linear 1ns bins over the same range would need millions of bins.
+//
+// The HDR (High Dynamic Range) histogram trick: constant RELATIVE error
+// instead of constant absolute error. Values are bucketed by
+//   (power-of-two octave, 64 linear sub-buckets within the octave)
+// so every bucket is at most 1/64 = 1.6% wide relative to its value.
+// 100ns resolves to ~2ns, 100us to ~2us - the same precision in
+// percentage terms, which is what percentile reporting actually needs.
+//
+// Recording is O(1) and branch-light: one bit_width() (a single LZCNT
+// instruction), a shift, and two increments. No allocation ever.
+// Percentile queries walk the ~2.4K buckets - O(buckets), done only by
+// the metrics thread at reporting time, never on the hot path.
+//
+// Thread safety: none. This is deliberately a plain single-threaded
+// structure owned by the metrics thread; samples arrive over an SPSC ring
+// (see main.cpp). Making the bins atomic would put contended cache-line
+// traffic back into the measurement path - the exact thing the ring
+// buffer design avoids.
 
-#include <algorithm>
 #include <array>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 namespace engine {
 
-/// @brief A fixed-bin histogram for latency measurement in nanoseconds.
 class LatencyTracker {
 public:
-    /// Number of histogram bins.
-    static constexpr size_t NUM_BINS = 1000;
+    // 64 sub-buckets per octave -> worst-case relative error 1/64 ~ 1.6%
+    static constexpr unsigned SUB_BITS  = 6;
+    static constexpr uint64_t SUB_COUNT = uint64_t{1} << SUB_BITS;
 
-    /// Width of each bin in nanoseconds (1 microsecond).
-    static constexpr uint64_t BIN_WIDTH_NS = 1000;
+    // highest exactly-tracked value ~ 2^42 ns ~ 73 minutes; anything above
+    // lands in the final (overflow) bucket. max() still reports it exactly.
+    static constexpr unsigned MAX_BITS = 42;
+    static constexpr size_t   NUM_BINS =
+        SUB_COUNT + (MAX_BITS - SUB_BITS) * SUB_COUNT;  // 64 + 36*64 = 2368
 
-    /// Maximum trackable latency before overflow (1 millisecond).
-    static constexpr uint64_t MAX_TRACKED_NS = NUM_BINS * BIN_WIDTH_NS;
+    LatencyTracker() = default;
 
-    LatencyTracker() {
-        reset();
-    }
-
-    /// @brief Record a latency sample.
-    /// @param nanoseconds  The latency to record, in nanoseconds.
-    void record(uint64_t nanoseconds) noexcept {
-        size_t bin = static_cast<size_t>(nanoseconds / BIN_WIDTH_NS);
-        if (bin >= NUM_BINS) {
-            bin = NUM_BINS - 1;  // Overflow into last bin
-        }
-
-        ++bins_[bin];
+    void record(uint64_t ns) noexcept {
+        size_t idx = bucket_index(ns);
+        if (idx >= NUM_BINS) idx = NUM_BINS - 1;
+        ++bins_[idx];
         ++count_;
-
-        if (nanoseconds > max_) {
-            max_ = nanoseconds;
-        }
+        sum_ += ns;
+        if (ns > max_) max_ = ns;
+        if (ns < min_) min_ = ns;
     }
 
-    /// @brief Get the p-th percentile latency.
-    /// @param percentile  Value in (0.0, 100.0], e.g. 50.0 for p50.
-    /// @return The latency (in ns) at the upper bound of the bin containing
-    ///         the requested percentile, or 0 if no samples recorded.
-    [[nodiscard]] uint64_t percentile(double percentile) const noexcept {
+    // latency at the requested percentile, reported as the upper bound of
+    // the bucket that contains it (i.e. "p99 <= this value", within 1.6%)
+    [[nodiscard]] uint64_t percentile(double pct) const noexcept {
         if (count_ == 0) return 0;
-
-        // Number of samples at or below the target percentile.
-        const uint64_t target = static_cast<uint64_t>(
-            (percentile / 100.0) * static_cast<double>(count_));
+        const auto target = static_cast<uint64_t>(
+            (pct / 100.0) * static_cast<double>(count_) + 0.5);
 
         uint64_t cumulative = 0;
         for (size_t i = 0; i < NUM_BINS; ++i) {
             cumulative += bins_[i];
-            if (cumulative >= target) {
-                return (i + 1) * BIN_WIDTH_NS;
-            }
+            if (cumulative >= target) return bucket_upper(i);
         }
-
-        return MAX_TRACKED_NS;  // All samples are in the overflow bin
+        return max_;
     }
 
-    /// @brief Median latency (p50).
-    [[nodiscard]] uint64_t p50() const noexcept { return percentile(50.0); }
-
-    /// @brief 95th percentile latency.
-    [[nodiscard]] uint64_t p95() const noexcept { return percentile(95.0); }
-
-    /// @brief 99th percentile latency.
-    [[nodiscard]] uint64_t p99() const noexcept { return percentile(99.0); }
-
-    /// @brief 99.9th percentile latency.
+    [[nodiscard]] uint64_t p50()  const noexcept { return percentile(50.0); }
+    [[nodiscard]] uint64_t p95()  const noexcept { return percentile(95.0); }
+    [[nodiscard]] uint64_t p99()  const noexcept { return percentile(99.0); }
     [[nodiscard]] uint64_t p999() const noexcept { return percentile(99.9); }
 
-    /// @brief Maximum recorded latency.
-    [[nodiscard]] uint64_t max() const noexcept { return max_; }
-
-    /// @brief Total number of recorded samples.
+    [[nodiscard]] uint64_t max()   const noexcept { return max_; }
+    [[nodiscard]] uint64_t min()   const noexcept { return count_ ? min_ : 0; }
     [[nodiscard]] uint64_t count() const noexcept { return count_; }
+    [[nodiscard]] uint64_t mean()  const noexcept {
+        return count_ ? sum_ / count_ : 0;
+    }
 
-    /// @brief Reset all bins and counters to zero.
     void reset() noexcept {
-        std::memset(bins_.data(), 0, sizeof(bins_));
+        bins_.fill(0);
         count_ = 0;
+        sum_   = 0;
         max_   = 0;
+        min_   = UINT64_MAX;
+    }
+
+    // exposed for tests
+    [[nodiscard]] static size_t bucket_index(uint64_t v) noexcept {
+        if (v < SUB_COUNT) return static_cast<size_t>(v);  // 0..63: exact
+        // msb >= 6. The top bit selects the octave; the next 6 bits below
+        // it select the sub-bucket (the leading 1 is implicit, so subtract
+        // SUB_COUNT to strip it)
+        const unsigned msb   = static_cast<unsigned>(std::bit_width(v)) - 1;
+        const unsigned shift = msb - SUB_BITS;
+        const auto     sub   = static_cast<size_t>((v >> shift) - SUB_COUNT);
+        return SUB_COUNT * (shift + 1) + sub;
+    }
+
+    [[nodiscard]] static uint64_t bucket_upper(size_t idx) noexcept {
+        if (idx < SUB_COUNT) return idx;
+        const size_t   oct = idx / SUB_COUNT - 1;
+        const uint64_t sub = idx % SUB_COUNT;
+        return ((SUB_COUNT + sub + 1) << oct) - 1;
     }
 
 private:
-    std::array<uint64_t, NUM_BINS> bins_{};  ///< Histogram bins
-    uint64_t count_ = 0;                     ///< Total samples recorded
-    uint64_t max_   = 0;                     ///< Maximum observed latency (ns)
+    std::array<uint64_t, NUM_BINS> bins_{};  // ~18.5 KB, lives in the tracker
+    uint64_t count_ = 0;
+    uint64_t sum_   = 0;
+    uint64_t max_   = 0;
+    uint64_t min_   = UINT64_MAX;
 };
 
 } // namespace engine

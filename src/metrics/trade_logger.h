@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <memory>
 #include <string>
 
 #include "transport/message.h"
@@ -48,6 +49,7 @@ public:
 private:
     std::FILE* file_         = nullptr;  ///< Binary log file handle
     size_t     total_logged_ = 0;        ///< Number of fills written
+    std::unique_ptr<char[]>   buffer_;   ///< Large stdio buffer (setvbuf)
 };
 
 } // namespace engine

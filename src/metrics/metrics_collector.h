@@ -3,9 +3,11 @@
 /// @file metrics_collector.h
 /// @brief Aggregates latency histograms and counters for engine diagnostics.
 ///
-/// Thread safety: The atomic counters are safe for concurrent access.
-/// LatencyTracker methods are NOT thread-safe — call record_*_latency()
-/// from the engine thread only.
+/// Ownership model (Commit 11): the collector lives entirely on the
+/// metrics/output thread. The engine thread never touches it - it ships
+/// raw nanosecond samples over an SPSC ring and this thread does all the
+/// histogram work. The atomic counters are kept atomic only so stray
+/// cross-thread reads (stats lines) stay defined behavior.
 
 #include <atomic>
 #include <cstdint>
@@ -44,6 +46,11 @@ public:
         total_matches_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    /// @brief Count telemetry samples lost because the sample ring was full.
+    void note_dropped_samples(uint64_t n) noexcept {
+        dropped_samples_.fetch_add(n, std::memory_order_relaxed);
+    }
+
     // -------------------------------------------------------------------
     // Reporting
     // -------------------------------------------------------------------
@@ -75,11 +82,16 @@ public:
         return total_matches_.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] uint64_t dropped_samples() const noexcept {
+        return dropped_samples_.load(std::memory_order_relaxed);
+    }
+
 private:
-    LatencyTracker            match_latency_;       ///< Match operation latency histogram
-    LatencyTracker            order_latency_;       ///< End-to-end order processing latency
+    LatencyTracker            match_latency_;       ///< Time inside MatchingEngine::process
+    LatencyTracker            order_latency_;       ///< Ingest push -> engine done (queue wait + match)
     std::atomic<uint64_t>     total_orders_{0};     ///< Total orders processed
     std::atomic<uint64_t>     total_matches_{0};    ///< Total fills generated
+    std::atomic<uint64_t>     dropped_samples_{0};  ///< Telemetry ring overflows
 };
 
 } // namespace engine

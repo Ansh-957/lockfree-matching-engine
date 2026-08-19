@@ -3,44 +3,45 @@
 
 #include "metrics/metrics_collector.h"
 
-#include <sstream>
 #include <iomanip>
+#include <sstream>
 
 namespace engine {
+
+namespace {
+
+void print_tracker(std::ostringstream& oss, const char* title,
+                   const LatencyTracker& t) {
+    oss << "--- " << title << " (ns) ---\n";
+    oss << "  samples: " << t.count() << "\n";
+    if (t.count() == 0) return;
+    oss << "  min:     " << std::setw(10) << t.min()  << "\n"
+        << "  mean:    " << std::setw(10) << t.mean() << "\n"
+        << "  p50:     " << std::setw(10) << t.p50()  << "\n"
+        << "  p95:     " << std::setw(10) << t.p95()  << "\n"
+        << "  p99:     " << std::setw(10) << t.p99()  << "\n"
+        << "  p99.9:   " << std::setw(10) << t.p999() << "\n"
+        << "  max:     " << std::setw(10) << t.max()  << "\n";
+}
+
+} // namespace
 
 std::string MetricsCollector::summary() const {
     std::ostringstream oss;
 
     oss << "========== Engine Metrics ==========\n";
-    oss << "Total orders processed: " << total_orders_.load(std::memory_order_relaxed) << "\n";
-    oss << "Total fills generated:  " << total_matches_.load(std::memory_order_relaxed) << "\n";
-    oss << "\n";
-
-    // Match latency stats
-    oss << "--- Match Latency (ns) ---\n";
-    oss << "  Samples: " << match_latency_.count() << "\n";
-    if (match_latency_.count() > 0) {
-        oss << "  p50:     " << std::setw(8) << match_latency_.p50()  << " ns\n";
-        oss << "  p95:     " << std::setw(8) << match_latency_.p95()  << " ns\n";
-        oss << "  p99:     " << std::setw(8) << match_latency_.p99()  << " ns\n";
-        oss << "  p99.9:   " << std::setw(8) << match_latency_.p999() << " ns\n";
-        oss << "  max:     " << std::setw(8) << match_latency_.max()  << " ns\n";
+    oss << "orders processed: " << total_orders() << "\n";
+    oss << "fills generated:  " << total_matches() << "\n";
+    if (dropped_samples() > 0) {
+        oss << "telemetry samples dropped (ring full): " << dropped_samples() << "\n";
     }
     oss << "\n";
 
-    // Order processing latency stats
-    oss << "--- Order Latency (ns) ---\n";
-    oss << "  Samples: " << order_latency_.count() << "\n";
-    if (order_latency_.count() > 0) {
-        oss << "  p50:     " << std::setw(8) << order_latency_.p50()  << " ns\n";
-        oss << "  p95:     " << std::setw(8) << order_latency_.p95()  << " ns\n";
-        oss << "  p99:     " << std::setw(8) << order_latency_.p99()  << " ns\n";
-        oss << "  p99.9:   " << std::setw(8) << order_latency_.p999() << " ns\n";
-        oss << "  max:     " << std::setw(8) << order_latency_.max()  << " ns\n";
-    }
+    print_tracker(oss, "Match latency: inside process()", match_latency_);
+    oss << "\n";
+    print_tracker(oss, "Order latency: ingest -> engine done", order_latency_);
 
     oss << "====================================\n";
-
     return oss.str();
 }
 
@@ -49,6 +50,7 @@ void MetricsCollector::reset() noexcept {
     order_latency_.reset();
     total_orders_.store(0, std::memory_order_relaxed);
     total_matches_.store(0, std::memory_order_relaxed);
+    dropped_samples_.store(0, std::memory_order_relaxed);
 }
 
 } // namespace engine

@@ -1,5 +1,9 @@
 #include "feed/coinbase_feed.h"
 
+#include <variant>
+
+#include "metrics/tsc_clock.h"
+
 namespace engine {
 
 CoinbaseFeed::CoinbaseFeed(std::string product_id)
@@ -25,7 +29,11 @@ void CoinbaseFeed::start(SPSCQueue<EngineMessage, FEED_QUEUE_SIZE>& queue) {
     ws_.set_message_handler([this](std::string_view raw) {
         batch_.clear();
         handler_.parse(raw, batch_);
-        for (const auto& msg : batch_) {
+        // stamp receive time so the engine can measure end-to-end
+        // (queue wait + match) latency per message
+        const uint64_t now = tsc::now_ns();
+        for (auto& msg : batch_) {
+            std::visit([now](auto& m) { m.timestamp = now; }, msg);
             if (queue_->try_push(msg)) {
                 pushed_.fetch_add(1, std::memory_order_relaxed);
             } else {

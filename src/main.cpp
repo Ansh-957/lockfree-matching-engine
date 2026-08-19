@@ -38,6 +38,9 @@
 #include "core/types.h"
 #include "feed/coinbase_feed.h"
 #include "feed/feed_handler.h"
+#include "metrics/metrics_collector.h"
+#include "metrics/trade_logger.h"
+#include "metrics/tsc_clock.h"
 #include "tools/synthetic_workload.h"
 #include "transport/message.h"
 #include "transport/spsc_queue.h"
@@ -101,8 +104,30 @@ struct Counters {
     std::atomic<uint64_t> processed{0};   // messages through the engine
     std::atomic<uint64_t> fills{0};       // fills emitted
     std::atomic<uint64_t> out_dropped{0}; // SPSC #2 full
+    std::atomic<uint64_t> lat_dropped{0}; // telemetry ring full
     std::atomic<uint64_t> pool_free{0};   // published by the engine thread
 };
+
+// ---- telemetry samples (Commit 11) -----------------------------------------
+//
+// The engine thread must never do histogram work: binning, percentile
+// bookkeeping, even a shared atomic bump would put cache traffic into the
+// measured path. Instead it ships raw nanosecond readings over a third
+// SPSC ring and the metrics (output) thread does all the aggregation.
+// If the ring is ever full the sample is DROPPED, not waited on - losing
+// a telemetry point is free, stalling the matching loop is not.
+
+struct LatencySample {
+    enum class Kind : uint8_t {
+        Match,  // time spent inside MatchingEngine::process()
+        Order,  // ingest push -> engine done (queue wait + match)
+    };
+    Kind     kind = Kind::Match;
+    uint64_t ns   = 0;
+};
+static_assert(std::is_trivially_copyable_v<LatencySample>);
+
+using LatencyQueue = SPSCQueue<LatencySample, 1u << 16>;
 
 // ---- config ----------------------------------------------------------------
 
@@ -110,6 +135,7 @@ struct Config {
     bool        live       = true;
     std::string product    = "BTC-USD";
     unsigned    duration_s = 0;   // 0 = run until Ctrl+C
+    std::string log_path   = "trades.bin";  // empty = logging disabled
 };
 
 Config parse_args(int argc, char* argv[]) {
@@ -124,9 +150,14 @@ Config parse_args(int argc, char* argv[]) {
             cfg.product = argv[++i];
         } else if (arg == "--duration" && i + 1 < argc) {
             cfg.duration_s = static_cast<unsigned>(std::atoi(argv[++i]));
+        } else if (arg == "--log" && i + 1 < argc) {
+            cfg.log_path = argv[++i];
+        } else if (arg == "--no-log") {
+            cfg.log_path.clear();
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: matching-engine [--live|--synthetic] "
-                         "[--product BTC-USD] [--duration seconds]\n";
+                         "[--product BTC-USD] [--duration seconds] "
+                         "[--log trades.bin | --no-log]\n";
             std::exit(0);
         } else {
             std::cerr << "Unknown argument: " << arg << " (see --help)\n";
@@ -149,7 +180,11 @@ void run_synthetic_ingest(InputQueue& in, Counters& c) {
     synth::WorkloadGenerator gen(wcfg);
 
     while (!g_shutdown.load(std::memory_order_acquire)) {
-        const EngineMessage msg = gen.next();
+        EngineMessage msg = gen.next();
+        // overwrite the generator's logical timestamp with a real clock
+        // reading so the engine can compute end-to-end (queue wait + match)
+        // latency for this message
+        std::visit([](auto& m) { m.timestamp = tsc::now_ns(); }, msg);
         while (!in.try_push(msg)) {
             if (g_shutdown.load(std::memory_order_acquire)) return;
             cpu_relax();  // backpressure: wait instead of dropping
@@ -158,17 +193,35 @@ void run_synthetic_ingest(InputQueue& in, Counters& c) {
     }
 }
 
-void run_engine(InputQueue& in, OutputQueue& out, Counters& c,
-                const std::atomic<bool>& stop) {
+void run_engine(InputQueue& in, OutputQueue& out, LatencyQueue& lat,
+                Counters& c, const std::atomic<bool>& stop) {
     MatchingEngine eng;
     c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
 
     EngineMessage msg;
     uint64_t since_publish = 0;
+    uint64_t lat_dropped   = 0;  // thread-local; published on exit
+
+    // the hot path's ENTIRE telemetry cost: two RDTSC reads and up to two
+    // ring pushes per message. All histogram work happens downstream.
+    const auto emit = [&](LatencySample::Kind k, uint64_t ns) {
+        if (!lat.try_push(LatencySample{k, ns})) ++lat_dropped;
+    };
 
     while (true) {
         if (in.try_pop(msg)) {
+            const uint64_t t0 = tsc::now_ns();
             const auto& fills = eng.process(msg);
+            const uint64_t t1 = tsc::now_ns();
+
+            emit(LatencySample::Kind::Match, t1 - t0);
+            // ingest stamped msg.timestamp with the same clock at push time
+            const auto ingest_ts = std::visit(
+                [](const auto& m) { return m.timestamp; }, msg);
+            if (ingest_ts != 0 && t1 > ingest_ts) {
+                emit(LatencySample::Kind::Order, t1 - ingest_ts);
+            }
+
             for (const Fill& f : fills) {
                 if (out.try_push(OutputMessage{f})) {
                     c.fills.fetch_add(1, std::memory_order_relaxed);
@@ -191,11 +244,16 @@ void run_engine(InputQueue& in, OutputQueue& out, Counters& c,
         }
     }
     c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
+    c.lat_dropped.store(lat_dropped, std::memory_order_relaxed);
 }
 
-// ingested_fn abstracts where the ingest count lives: the synthetic loop
-// bumps our counter, but the live feed counts pushes internally
-void run_output(OutputQueue& out, Counters& c, const std::atomic<bool>& stop,
+// The metrics worker thread: drains fills (tape + binary log) and raw
+// latency samples (histogram binning). ingested_fn abstracts where the
+// ingest count lives: the synthetic loop bumps our counter, but the live
+// feed counts pushes internally.
+void run_output(OutputQueue& out, LatencyQueue& lat, Counters& c,
+                MetricsCollector& metrics, TradeLogger& logger,
+                const std::atomic<bool>& stop,
                 const std::function<uint64_t()>& ingested_fn) {
     using clock = std::chrono::steady_clock;
     const auto start     = clock::now();
@@ -204,6 +262,7 @@ void run_output(OutputQueue& out, Counters& c, const std::atomic<bool>& stop,
     uint64_t tape_printed = 0;
     uint64_t last_ingested = 0;
     OutputMessage msg;
+    LatencySample sample;
 
     const auto print_stats = [&] {
         const auto now = clock::now();
@@ -212,21 +271,42 @@ void run_output(OutputQueue& out, Counters& c, const std::atomic<bool>& stop,
         const uint64_t ing  = ingested_fn();
         const uint64_t rate = (ing - last_ingested) / 5;
         last_ingested = ing;
+        const auto& ml = metrics.match_latency();
         std::cout << "[stats t=" << t << "s]"
                   << " ingested=" << ing << " (" << rate << "/s)"
                   << " processed=" << c.processed.load(std::memory_order_relaxed)
                   << " fills=" << c.fills.load(std::memory_order_relaxed)
+                  << " match_p50=" << ml.p50() << "ns"
+                  << " p99=" << ml.p99() << "ns"
                   << " dropped_out=" << c.out_dropped.load(std::memory_order_relaxed)
                   << " pool_free=" << c.pool_free.load(std::memory_order_relaxed)
                   << "\n";
     };
 
+    uint64_t iter = 0;
     while (true) {
+        bool did_work = false;
+
+        // drain latency samples first and in batches - in synthetic mode
+        // this ring carries ~2 samples per message, far more traffic than
+        // the fill queue
+        for (int i = 0; i < 4096 && lat.try_pop(sample); ++i) {
+            if (sample.kind == LatencySample::Kind::Match) {
+                metrics.record_match_latency(sample.ns);
+                metrics.increment_orders();
+            } else {
+                metrics.record_order_latency(sample.ns);
+            }
+            did_work = true;
+        }
+
         if (out.try_pop(msg)) {
+            did_work = true;
             if (const auto* fill = std::get_if<FillMessage>(&msg)) {
+                logger.log(*fill);
+                metrics.increment_matches();
                 // sample the tape: the first few fills prove the pipeline
-                // end to end; after that only 1-in-a-million (synthetic mode
-                // produces tens of millions of fills)
+                // end to end; after that only 1-in-a-million
                 if (tape_printed < 5 || (tape_printed & ((1u << 20) - 1)) == 0) {
                     std::cout << "[fill #" << tape_printed + 1 << "] "
                               << "taker=" << fill->aggressive_id
@@ -236,17 +316,27 @@ void run_output(OutputQueue& out, Counters& c, const std::atomic<bool>& stop,
                 }
                 ++tape_printed;
             }
-        } else if (stop.load(std::memory_order_acquire)) {
-            break;
-        } else {
+        }
+
+        // check the stats timer even when saturated with work (in synthetic
+        // mode the sample ring never runs dry, so "idle" never happens) -
+        // but only every 256 iterations, clock reads aren't free
+        if (!did_work || (++iter & 0xFF) == 0) {
             if (clock::now() >= next_stat) {
                 print_stats();
                 next_stat += std::chrono::seconds(5);
+            }
+        }
+
+        if (!did_work) {
+            if (stop.load(std::memory_order_acquire)) {
+                break;  // engine joined AND both rings drained
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
     print_stats();
+    metrics.note_dropped_samples(c.lat_dropped.load(std::memory_order_relaxed));
 }
 
 } // namespace
@@ -257,6 +347,10 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // learn the TSC frequency now (20ms sleep) rather than lazily inside
+    // the first timed message on the hot path
+    tsc::calibrate();
+
     std::cout << "matching-engine v0.1.0 | mode="
               << (cfg.live ? "live" : "synthetic")
               << (cfg.live ? " product=" + cfg.product : "")
@@ -264,9 +358,21 @@ int main(int argc, char* argv[]) {
                                  : " (Ctrl+C to stop)")
               << "\n";
 
-    InputQueue  input_queue;
-    OutputQueue output_queue;
-    Counters    counters;
+    InputQueue   input_queue;
+    OutputQueue  output_queue;
+    LatencyQueue latency_queue;
+    Counters     counters;
+
+    MetricsCollector metrics;
+    TradeLogger      logger;
+    if (!cfg.log_path.empty()) {
+        if (logger.open(cfg.log_path)) {
+            std::cout << "[init] logging fills to " << cfg.log_path << "\n";
+        } else {
+            std::cerr << "[init] WARNING: could not open " << cfg.log_path
+                      << ", fill logging disabled\n";
+        }
+    }
 
     std::atomic<bool> engine_stop{false};
     std::atomic<bool> output_stop{false};
@@ -290,7 +396,8 @@ int main(int argc, char* argv[]) {
         if (try_realtime_priority()) {
             std::cout << "[init] engine thread: SCHED_FIFO acquired\n";
         }
-        run_engine(input_queue, output_queue, counters, engine_stop);
+        run_engine(input_queue, output_queue, latency_queue, counters,
+                   engine_stop);
     });
 
     // ---- output thread (core 2): tape + stats ----
@@ -302,7 +409,8 @@ int main(int argc, char* argv[]) {
               });
     std::thread output_thread([&] {
         pin_to_core(2);
-        run_output(output_queue, counters, output_stop, ingested_fn);
+        run_output(output_queue, latency_queue, counters, metrics, logger,
+                   output_stop, ingested_fn);
     });
 
     // ---- main thread: wait for signal or deadline ----
@@ -329,6 +437,8 @@ int main(int argc, char* argv[]) {
     output_stop.store(true, std::memory_order_release);
     output_thread.join();     // drains SPSC #2, prints final stats
 
+    logger.close();  // flushes the stdio buffer
+
     if (cfg.live) {
         std::cout << "[shutdown] feed: live_levels=" << feed.handler().live_levels()
                   << " malformed=" << feed.handler().malformed_count()
@@ -336,6 +446,11 @@ int main(int argc, char* argv[]) {
                   << " seq_gaps=" << feed.handler().sequence_gaps()
                   << " feed_dropped=" << feed.dropped() << "\n";
     }
+    if (logger.total_logged() > 0) {
+        std::cout << "[shutdown] " << logger.total_logged()
+                  << " fills logged to " << cfg.log_path << "\n";
+    }
+    std::cout << "\n" << metrics.summary();
     std::cout << "[shutdown] clean exit\n";
     return 0;
 }
