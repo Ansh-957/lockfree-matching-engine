@@ -791,3 +791,210 @@ governor, and ideally core pinning:
 Already comfortably inside the plan's aspirational targets (sub-500ns add,
 sub-1µs match) — but the honest measurement happens in Phase 4 with `perf`
 on bare metal.
+
+---
+
+## Commit 8 — Streaming Client Layer (`ws_client.h/.cpp`)
+
+This is the first piece of Phase 3: a live TLS WebSocket connection to
+Coinbase. Parsing JSON into engine messages is Commit 9; this commit only
+owns the *transport*. The client delivers raw text frames and knows nothing
+about Coinbase, tickers, or order books.
+
+The gate from the commit plan was: handshake with Coinbase's public
+endpoint and keep the TLS stream alive. Verified with `ws-smoke` against
+`wss://ws-feed.exchange.coinbase.com` — subscription ack + live BTC-USD
+ticker frames, then a clean close.
+
+### Why Boost.Beast (and what Asio actually is)
+
+A WebSocket is HTTP/1.1 that *upgrades* into a framed bidirectional stream.
+Doing that by hand (TCP → TLS → HTTP upgrade → frame parser → ping/pong)
+is a lot of protocol surface and a lot of ways to get the shutdown path
+wrong. Beast is Boost's HTTP/WebSocket library; it sits on **Boost.Asio**,
+which is the event-loop library underneath.
+
+Asio's model, in one picture:
+
+```
+io_context          a queue of "this socket is readable / this timer fired"
+async_X(..., cb)    start the operation, return immediately; later the
+                    io_context invokes cb on the thread that called run()
+ioc.run()           block, dispatching callbacks until no work remains
+```
+
+Nothing in this client *blocks* a syscall on the calling thread except
+`run()` itself. `async_resolve` → `async_connect` → `async_handshake` (TLS)
+→ `async_handshake` (WebSocket) → `async_read` loop. Each completion
+handler either starts the next step or calls `schedule_reconnect`.
+
+This is **not** multithreading. It is cooperative concurrency on one
+thread: the OS notifies Asio, Asio runs one callback at a time. That is
+why the client has **zero mutexes**. All the socket/queue/timer state is
+touched only on the `run()` thread.
+
+### Thread-safe `send()` / `stop()` without locks
+
+The ingestion thread will eventually call `run()`. The rest of the program
+(signal handler, later the matching thread if we ever need to unsubscribe)
+must be able to send or shut down *without* touching that state directly.
+
+```cpp
+void send(std::string text) {
+    net::post(ioc_, [this, msg = std::move(text)]() mutable {
+        write_queue_.push_back(std::move(msg));
+        ...
+    });
+}
+```
+
+`asio::post(ioc, fn)` means "queue `fn` as a callback on the io_context".
+When `run()` next gets to it, it runs on the io thread — so `write_queue_`
+is still single-threaded. The string is moved into the lambda so the
+caller can return immediately without waiting for the write.
+
+Same pattern for `stop()`: it does not close the socket from the caller's
+thread (that would race with an in-flight `async_read`). It posts "set
+`stopping_`, cancel the reconnect timer, send a WebSocket close frame".
+
+### Why writes go through a `std::deque`
+
+WebSocket frames must not overlap on the wire: you cannot start a second
+`async_write` until the first completes. Incoming `send()` calls can
+arrive faster than the socket drains, so they land in `write_queue_`.
+`writing_` is the "an async_write is in flight" flag. The completion
+handler pops the front and, if anything remains, starts the next write.
+Classic producer-side serialization, no lock, because only the io thread
+touches the deque.
+
+On reconnect the queue is **cleared**. Anything sitting there was for the
+dead connection. Subscriptions are not stored inside the client — they
+are re-sent by the **connect handler**, which fires after every successful
+(re)handshake. That is the layering: the client reconnects the pipe; the
+caller remembers what it wanted to say on a live pipe.
+
+### The connect state machine
+
+```
+start_connect
+    emplace a fresh WsStream          (a used TLS stream cannot be reused)
+    async_resolve(host, port)
+        async_connect (TCP)
+            SSL_set_tlsext_host_name  (SNI — see below)
+            async_handshake (TLS)
+                set idle timeout + keep-alive pings
+                async_handshake (WebSocket GET + Upgrade)
+                    connect_handler_()     // caller sends subscribe here
+                    do_read()              // arm the forever-read loop
+```
+
+Any `error_code` at any step goes to `schedule_reconnect`. The one
+exception is `operation_aborted`: that means *we* cancelled the op
+(shutdown, or we already tore this connection down). Reconnecting on our
+own cancel would loop forever.
+
+### Exponential backoff
+
+A tight reconnect loop against a down exchange would spin the CPU and
+look like an attack. Backoff is:
+
+```
+delay = min(base * 2^attempts, max)     // 500ms, 1s, 2s, ... cap 30s
+```
+
+The shift is itself clamped at 16 so `1u << n` cannot overflow during a
+multi-day outage. A successful handshake resets `reconnect_attempts_` to
+0, so a brief blip does not leave you stuck at the 30s cap.
+
+`std::optional<WsStream> ws_` plus `emplace()` is how we get a *new*
+stream per attempt. After a TLS session has been used (or failed partway),
+OpenSSL will not handshake it again. Optional's destructor runs on the
+old stream, then `emplace` constructs a fresh one in the same slot.
+
+### TLS: verify the peer, and send SNI
+
+A market-data feed is an input to trading logic. Blindly accepting any
+certificate (`verify_none`) would let a MITM inject fake book updates.
+`set_default_verify_paths()` loads the system's CA bundle;
+`verify_peer` makes the handshake fail if the chain doesn't check out.
+
+**SNI (Server Name Indication)** is a TLS extension: the ClientHello
+carries the hostname, so a server that hosts many certificates on one IP
+knows which one to present. Coinbase (and essentially every CDN) requires
+it. The OpenSSL API is a C macro that expands to an old-style cast, which
+trips `-Wold-style-cast`; the `#pragma GCC diagnostic` around
+`SSL_set_tlsext_host_name` is local suppression of that one C API, not a
+blanket warning disable.
+
+The nested stream type looks noisy:
+
+```cpp
+websocket::stream<ssl::stream<beast::tcp_stream>>
+```
+
+Read it inside-out: a TCP socket, wrapped in TLS, wrapped in WebSocket
+framing. `next_layer()` peels one wrapper (TLS), `get_lowest_layer()`
+peels all the way to TCP (timeouts, connect, close).
+
+### Idle timeout = heartbeat, without a custom ping loop
+
+Beast's `stream_base::timeout` with `keep_alive_pings = true` and
+`idle_timeout = 30s` does two things:
+
+1. If the connection is silent for 30s, Beast sends a WebSocket ping.
+2. If the peer doesn't pong (or send anything else) before the timeout,
+   the pending `async_read` completes with an error → reconnect.
+
+Beast also answers *incoming* pings with pongs automatically. So we get
+RFC 6455 heartbeat behavior as a stream option, not as a second timer we
+would have to keep in sync with the read loop. After the WebSocket
+handshake we call `expires_never()` on the *TCP* timer so it does not
+fight the WebSocket-layer timeout.
+
+### `string_view` lifetime on the message handler
+
+`async_read` appends into a reused `flat_buffer`. The handler is given a
+`string_view` over those bytes. That view is **invalid the moment the
+handler returns** — `buffer_.consume()` then `do_read()` reuse the same
+memory. Callers that need to keep the payload (simdjson in Commit 9)
+must copy or parse in-place before returning. This is the same "returned
+reference dies at the next call" rule as `MatchingEngine::process`.
+
+### The include that looks like a no-op: `websocket/ssl.hpp`
+
+Compiling a `websocket::stream<ssl::stream<...>>` without this header
+fails with `static assertion failed: Unknown Socket type in async_teardown`.
+WebSocket close has to shut down TLS *and* TCP in the right order; Beast
+puts that specialization in a separate header so the core WebSocket code
+does not depend on OpenSSL. Forgetting it is a classic first-time Beast
+TLS bug.
+
+### CMake: `BUILD_FEED` stays opt-in
+
+The core + tests + benches still build with no Boost/OpenSSL. Flipping
+`BUILD_FEED=ON` pulls in only what Commit 8 needs (`Boost::headers` is
+header-only Asio/Beast; OpenSSL is the TLS implementation). simdjson,
+spdlog, `coinbase_feed.cpp`, and `main.cpp` stay commented until their
+commits — same "add sources as they exist" pattern as the unit tests.
+
+On this Linux box Boost/OpenSSL *dev* packages were not installed
+system-wide, so headers/libs were extracted into gitignored
+`.toolchain/sysroot/` and passed to CMake via `Boost_INCLUDE_DIR` /
+`OPENSSL_*`. That is a local workaround, not part of the repo. On
+Windows, vcpkg (`vcpkg.json` already lists `boost-beast` / `boost-asio`)
+supplies the same libraries.
+
+### How to verify (do this; it hits the live exchange)
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_FEED=ON \
+      -DCMAKE_MAKE_PROGRAM=$PWD/.toolchain/ninja
+cmake --build build --target ws-smoke
+./build/ws-smoke 5                          # live Coinbase ticker
+./build/ws-smoke 0 127.0.0.1 1              # reconnect backoff demo
+```
+
+`num_messages=0` means "don't wait for data": print three failed
+connects with increasing delay, then `stop()`. That exercises the path
+the earlier live handshake never hit (resolve/connect failure → timer →
+retry) without needing to yank a network cable.
