@@ -2,7 +2,8 @@
 //
 //   ingest (core 0)  CoinbaseFeed or synthetic generator -> SPSC #1
 //   engine (core 1)  SPSC #1 -> MatchingEngine -> SPSC #2
-//   output (core 2)  SPSC #2 -> trade tape + throughput stats
+//   output (core 3)  SPSC #2 -> trade tape + throughput stats
+//                    (core 3, not 2: cpu2 is cpu1's hyperthread sibling)
 //
 // Shutdown is staged in pipeline order so no queue is abandoned with a
 // producer still running:
@@ -400,7 +401,14 @@ int main(int argc, char* argv[]) {
                    engine_stop);
     });
 
-    // ---- output thread (core 2): tape + stats ----
+    // ---- output thread (core 3): tape + stats ----
+    //
+    // NOT core 2: on hybrid Intel (this dev box is a Core Ultra 155H),
+    // cpu1 and cpu2 are hyperthread SIBLINGS of the same physical P-core.
+    // Pinning the output thread there would make its histogram work steal
+    // execution resources from the engine's hot loop. cpu3 is the next
+    // distinct physical core. (cpu0's sibling is cpu5, so ingest/engine
+    // were already separate.)
     const std::function<uint64_t()> ingested_fn =
         cfg.live
             ? std::function<uint64_t()>([&feed] { return feed.pushed(); })
@@ -408,7 +416,7 @@ int main(int argc, char* argv[]) {
                   return counters.ingested.load(std::memory_order_relaxed);
               });
     std::thread output_thread([&] {
-        pin_to_core(2);
+        pin_to_core(3);
         run_output(output_queue, latency_queue, counters, metrics, logger,
                    output_stop, ingested_fn);
     });

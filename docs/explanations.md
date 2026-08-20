@@ -1431,3 +1431,122 @@ without requiring `BUILD_FEED`.
 ./build/matching-engine --live --duration 25        # match p99 ~ 600ns live
 xxd -l 16 trades.bin                                # FILL header + records
 ```
+
+---
+
+## Commit 12 — Profiling Baseline (`docs/benchmarks.md`, `README.md`, bench fixes)
+
+This commit locks in the project's official numbers. Most of the work was
+not running benchmarks — it was making sure the benchmarks deserved to be
+believed. Three things had to be fixed or verified before any number went
+into the docs.
+
+### Fix 1: two benchmarks were measuring deleted code
+
+`memory_pool_bench` reported **0.22ns "allocations"** — about one CPU
+cycle, an obvious red flag. Cause: `allocate()` immediately followed by
+`deallocate()` of the same pointer restores the pool to its exact prior
+state, both functions inline, so the optimizer folded the pair to almost
+nothing. `matching_bench` was worse: never-implemented TODO stubs
+reporting 0.000ns.
+
+The rewrite uses a **rolling window of 256 live allocations**: each
+iteration frees the *oldest* pointer and allocates a new one, so the
+free-list head genuinely changes every iteration and the working set
+resembles the real engine (many live orders) instead of one hot slot.
+
+How do you prove a sub-nanosecond result is real and not still folded?
+**Make it respond to physics.** Growing the window to 1MiB (spilling L1
+into L2) moved the result from 0.44ns to 1.03ns. Deleted code does not
+slow down under cache pressure; real memory operations do. The 0.44ns
+number stands — a hot freelist pop+push is two L1 pointer swaps that a
+wide out-of-order core overlaps across iterations — vs 9.3ns for
+new/delete: **21×**.
+
+### Fix 2: the std::map baseline (the project's headline claim, finally measured)
+
+The whole design rests on "flat array beats tree book", and until now that
+was an argument, not a measurement. `matching_bench` now contains
+`MapBookEngine` — the textbook implementation (`std::map<Price, Level>`
+red-black tree, `std::list` per level, node allocation on every insert,
+iterator-storing id map) with matching semantics that mirror the real
+engine exactly.
+
+Both engines consume the **identical deterministic stream** (same
+generator, same seed, 1M messages, 35% cancels) — and produced the
+**identical 584,908 fills**, which doubles as a correctness cross-check of
+both implementations against each other.
+
+Result: **27.7M vs 15.9M msg/s = 1.74× end-to-end.** The honest framing
+matters: micro-level structural gaps are much larger (14.7ns array add vs
+tree descent + 9.3ns node allocation), but end-to-end includes matching
+and hash-map cancels that both engines share, which dilutes the ratio.
+1.74× on the full workload is the number that means something.
+
+### Fix 3: the pinning bug a hybrid CPU was hiding
+
+This machine is a Meteor Lake hybrid (6 P-cores with HT + 8 E + 2 LP-E).
+Reading `/sys/devices/system/cpu/*/topology` revealed that **cpu1 and cpu2
+are hyperthread siblings of the same physical P-core** — meaning since
+Commit 10, the output thread (histogram binning, stats printing) had been
+pinned onto the engine thread's own core, sharing its execution ports and
+L1/L2. Moving output to cpu3 (a distinct physical core): ~3.65M → ~3.85M
+msg/s (+5%) and, more importantly, removes a structural noise source from
+every future measurement.
+
+Lesson recorded in the docs: on hybrid parts, never assume cpu N and
+cpu N+1 are different cores — check the topology files.
+
+### What got documented and how
+
+`docs/benchmarks.md` is now the single source of measured truth:
+hardware/OS/compiler spec, the hybrid-pinning methodology, every result
+table filled with real numbers, and an **optimization log** quantifying
+each design decision (map→flat 1.74×, pool 21×, telemetry observer cost
+35%, pinning fix +5%). The README carries the headline table.
+
+Two principles applied throughout:
+
+1. **Caveats live next to the numbers they qualify.** The governor was
+   `powersave` (root needed to change it) — stated. The synthetic max
+   latency of ~109ms is scheduler preemption, not the engine — stated,
+   with p99.9 shown as the engine's own figure.
+2. **Suspicious numbers get investigated, not published.** Every
+   sub-nanosecond result in the docs has a written justification for why
+   it is physical.
+
+### The perf counters, and two lessons they taught
+
+After unlocking `perf_event_paranoid` (user ran the sysctl), the hardware
+counters completed the story:
+
+- **Hot matching loop (flat book): IPC 1.46, L1d miss 0.87%, branch miss
+  1.55%.** The same loop on the `std::map` baseline: L1d miss 2.66%,
+  branch miss 4.59% — both 3× worse. This is the flat-array thesis
+  verified at the hardware level: tree lookups are dependent pointer
+  chases (cache misses) plus data-dependent comparisons (mispredicts);
+  array indexing gives the prefetcher and predictor regular patterns.
+- **Whole-process IPC is 0.40 — and that is fine.** Spin-wait threads
+  execute billions of PAUSE iterations, which are deliberately cheap,
+  low-IPC instructions. Lesson one: *know which counters describe your
+  architecture versus your code quality.* Process-wide IPC describes the
+  spin-wait architecture; hot-loop IPC describes the engine. (CPU
+  migrations = 30 over 15s confirmed the pinning works.)
+- Lesson two: **the `performance` governor made wall-clock numbers
+  *slower* on this laptop.** Holding 22 CPUs at frequency spends the
+  shared package power budget that `powersave` had been leaving for the
+  single busy P-core's turbo — and back-to-back suites heat-soak the
+  package (measured: 3.9–4.3 of 4.5GHz at 73°C, numbers degrading run
+  over run). So the docs record the cold-run baseline, state ±10–15%
+  variance honestly, and lean on the counter *ratios* (IPC, miss rates),
+  which are frequency-independent and reproduced across every
+  configuration tested.
+
+### How to verify
+
+```bash
+./build/matching_bench --benchmark_min_time=2s      # flat vs std::map
+./build/memory_pool_bench --benchmark_min_time=1s   # pool vs new/delete
+./build/order_book_bench --benchmark_min_time=1s
+./build/ring_buffer_bench --benchmark_min_time=1s
+```

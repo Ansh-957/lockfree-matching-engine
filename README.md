@@ -61,14 +61,24 @@ A high-performance C++20 matching engine ingesting live cryptocurrency market da
 
 ## Benchmark Results
 
-> 🚧 **Coming soon** — benchmarks will be populated after Phase 4 (Weeks 7–8) with Google Benchmark results and `perf stat` profiling data.
+Measured on an Intel Core Ultra 7 155H (see [`docs/benchmarks.md`](docs/benchmarks.md) for methodology, environment caveats, and the full tables):
 
-See [`docs/benchmarks.md`](docs/benchmarks.md) for methodology and detailed results.
+| Metric | Result |
+|--------|--------|
+| Match latency, live Coinbase BTC-USD | **p50 28ns · p99 567ns** |
+| Match latency, synthetic saturation (38.5M msgs) | p50 66ns · p99 759ns |
+| Sustained pipeline throughput (3 threads, full telemetry) | **~3.85M msgs/s** |
+| Flat-array book vs `std::map` baseline, identical 1M-msg stream | **1.74× faster** |
+| Memory pool vs `new`/`delete` allocation cycle | **21× faster** |
+| SPSC ring, cross-thread (48-byte messages) | 480M msgs/s · ~97ns one-way |
+| Order book add / match / cancel | 14.7ns / 8.2ns / 43.2ns |
+| Matching hot loop, perf-verified | IPC 1.46 · 0.87% L1d miss · 1.55% branch miss |
+| Hot-path heap allocations | **0** |
 
 ### Future Optimizations
-- Replace `std::unordered_map<OrderId, Order*>` with a dense slot array using generation counters to eliminate hash-map cache misses on cancel lookups
-- CPU core pinning with `SCHED_FIFO` thread priority
-- `RDTSC`-based timestamping for sub-nanosecond measurement resolution
+- Replace `std::unordered_map<OrderId, Order*>` with a dense slot array using generation counters to eliminate hash-map cache misses on cancel lookups (cancel at 43ns is ~3× add, and the lookup is why)
+- Sampled telemetry (e.g. 1-in-16) to reclaim most of the ~35% observer cost of timing every message
+- Sub-1% L1d miss rate already achieved (perf-verified); next win is the cancel-path hash lookup above
 
 ## Building
 
@@ -103,15 +113,15 @@ cd build && ctest --output-on-failure
 ./build/memory_pool_bench --benchmark_format=console
 ```
 
-### Run with Synthetic Data
+### Run the Pipeline
 ```bash
-./build/synthetic-generator --num-orders 1000000 --output synthetic_data.bin
-./build/matching-engine --synthetic synthetic_data.bin
-```
+# synthetic load test (no network), 10 seconds, fills logged to trades.bin
+./build/matching-engine --synthetic --duration 10
 
-### Run with Live Feed
-```bash
+# live Coinbase BTC-USD until Ctrl+C; prints latency histograms on exit
 ./build/matching-engine --live
+
+# options: --product ETH-USD | --duration N | --log FILE | --no-log
 ```
 
 ## Project Structure
