@@ -25,7 +25,12 @@
 #include <cstdint>
 
 #if defined(__x86_64__) || defined(_M_X64)
+// __rdtsc lives in x86intrin.h on GCC/Clang but intrin.h on MSVC
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
 #include <x86intrin.h>
+#endif
 #define ENGINE_HAS_TSC 1
 #else
 #include <chrono>

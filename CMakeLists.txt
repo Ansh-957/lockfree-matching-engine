@@ -27,6 +27,8 @@ if(MSVC)
     # C4324 warns that alignas() padded a struct - that padding is the whole
     # point of cache-line alignment, so the warning is noise here
     target_compile_options(engine_warnings INTERFACE /W4 /permissive- /wd4324)
+    # portable fopen/fwrite in trade_logger is intentional; fopen_s is MSVC-only
+    target_compile_definitions(engine_warnings INTERFACE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(engine_warnings INTERFACE
         -Wall -Wextra -Wpedantic -Wshadow -Wconversion
