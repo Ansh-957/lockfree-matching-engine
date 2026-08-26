@@ -15,6 +15,7 @@
 // things a signal handler may safely do (iostream, malloc, locks are all
 // forbidden in signal context).
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -22,10 +23,12 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <variant>
+#include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -42,9 +45,14 @@
 #include "metrics/metrics_collector.h"
 #include "metrics/trade_logger.h"
 #include "metrics/tsc_clock.h"
+#include "server/dashboard_hub.h"
 #include "tools/synthetic_workload.h"
 #include "transport/message.h"
 #include "transport/spsc_queue.h"
+
+#if ENGINE_HAS_DASHBOARD
+#include "server/ws_server.h"
+#endif
 
 namespace {
 
@@ -137,6 +145,7 @@ struct Config {
     std::string product    = "BTC-USD";
     unsigned    duration_s = 0;   // 0 = run until Ctrl+C
     std::string log_path   = "trades.bin";  // empty = logging disabled
+    uint16_t    dash_port  = 0;   // 0 = dashboard off
 };
 
 Config parse_args(int argc, char* argv[]) {
@@ -155,10 +164,15 @@ Config parse_args(int argc, char* argv[]) {
             cfg.log_path = argv[++i];
         } else if (arg == "--no-log") {
             cfg.log_path.clear();
+        } else if (arg == "--dashboard") {
+            cfg.dash_port = 9100;
+        } else if (arg == "--dashboard-port" && i + 1 < argc) {
+            cfg.dash_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: matching-engine [--live|--synthetic] "
                          "[--product BTC-USD] [--duration seconds] "
-                         "[--log trades.bin | --no-log]\n";
+                         "[--log trades.bin | --no-log] "
+                         "[--dashboard | --dashboard-port N]\n";
             std::exit(0);
         } else {
             std::cerr << "Unknown argument: " << arg << " (see --help)\n";
@@ -195,7 +209,8 @@ void run_synthetic_ingest(InputQueue& in, Counters& c) {
 }
 
 void run_engine(InputQueue& in, OutputQueue& out, LatencyQueue& lat,
-                Counters& c, const std::atomic<bool>& stop) {
+                Counters& c, const std::atomic<bool>& stop,
+                DashboardHub* hub) {
     MatchingEngine eng;
     c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
 
@@ -238,9 +253,20 @@ void run_engine(InputQueue& in, OutputQueue& out, LatencyQueue& lat,
                 since_publish = 0;
                 c.pool_free.store(eng.pool_available(), std::memory_order_relaxed);
             }
+
+            // dashboard book snapshot: one relaxed bool load per message;
+            // the walk+copy only happens when the server asked (10Hz)
+            if (hub && hub->book_wanted()) {
+                hub->publish_book(eng.book());
+            }
         } else if (stop.load(std::memory_order_acquire)) {
             break;  // producer joined AND queue drained
         } else {
+            // service snapshot requests even when the market is quiet,
+            // otherwise the dashboard freezes between messages
+            if (hub && hub->book_wanted()) {
+                hub->publish_book(eng.book());
+            }
             cpu_relax();
         }
     }
@@ -255,15 +281,51 @@ void run_engine(InputQueue& in, OutputQueue& out, LatencyQueue& lat,
 void run_output(OutputQueue& out, LatencyQueue& lat, Counters& c,
                 MetricsCollector& metrics, TradeLogger& logger,
                 const std::atomic<bool>& stop,
-                const std::function<uint64_t()>& ingested_fn) {
+                const std::function<uint64_t()>& ingested_fn,
+                DashboardHub* hub,
+                const std::function<uint64_t()>& clients_fn) {
     using clock = std::chrono::steady_clock;
     const auto start     = clock::now();
     auto       next_stat = start + std::chrono::seconds(5);
+    auto       next_pub  = start + std::chrono::milliseconds(100);
 
     uint64_t tape_printed = 0;
     uint64_t last_ingested = 0;
     OutputMessage msg;
     LatencySample sample;
+
+    // fills held locally between dashboard publishes; only the newest
+    // FILL_KEEP matter, so overflow just overwrites the oldest
+    std::vector<DashboardHub::FillRow> pending_fills;
+    pending_fills.reserve(DashboardHub::FILL_KEEP);
+    size_t   pending_head = 0;
+    uint64_t fill_seq     = 0;
+
+    const auto publish_dashboard = [&] {
+        if (!hub) return;
+        DashboardHub::Stats s;
+        s.match_p50     = metrics.match_latency().p50();
+        s.match_p95     = metrics.match_latency().p95();
+        s.match_p99     = metrics.match_latency().p99();
+        s.order_p50     = metrics.order_latency().p50();
+        s.order_p99     = metrics.order_latency().p99();
+        s.processed     = c.processed.load(std::memory_order_relaxed);
+        s.fills         = c.fills.load(std::memory_order_relaxed);
+        s.pool_free     = c.pool_free.load(std::memory_order_relaxed);
+        s.pool_capacity = MatchingEngine::ORDER_POOL_SIZE;
+        s.dropped       = c.out_dropped.load(std::memory_order_relaxed);
+        s.clients       = clients_fn ? clients_fn() : 0;
+
+        // ring order: rotate so rows go out oldest-first
+        if (pending_head != 0 && pending_fills.size() == DashboardHub::FILL_KEEP) {
+            std::rotate(pending_fills.begin(),
+                        pending_fills.begin() + static_cast<std::ptrdiff_t>(pending_head),
+                        pending_fills.end());
+        }
+        hub->publish_output(s, pending_fills.data(), pending_fills.size());
+        pending_fills.clear();
+        pending_head = 0;
+    };
 
     const auto print_stats = [&] {
         const auto now = clock::now();
@@ -306,6 +368,21 @@ void run_output(OutputQueue& out, LatencyQueue& lat, Counters& c,
             if (const auto* fill = std::get_if<FillMessage>(&msg)) {
                 logger.log(*fill);
                 metrics.increment_matches();
+                if (hub) {
+                    const auto now_ms = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+                    const DashboardHub::FillRow row{
+                        ++fill_seq, now_ms, fill->price, fill->quantity,
+                        fill->aggressor_side == Side::Bid};
+                    if (pending_fills.size() < DashboardHub::FILL_KEEP) {
+                        pending_fills.push_back(row);
+                    } else {
+                        pending_fills[pending_head] = row;
+                        pending_head = (pending_head + 1) % DashboardHub::FILL_KEEP;
+                    }
+                }
                 // sample the tape: the first few fills prove the pipeline
                 // end to end; after that only 1-in-a-million
                 if (tape_printed < 5 || (tape_printed & ((1u << 20) - 1)) == 0) {
@@ -323,7 +400,13 @@ void run_output(OutputQueue& out, LatencyQueue& lat, Counters& c,
         // mode the sample ring never runs dry, so "idle" never happens) -
         // but only every 256 iterations, clock reads aren't free
         if (!did_work || (++iter & 0xFF) == 0) {
-            if (clock::now() >= next_stat) {
+            const auto now = clock::now();
+            if (now >= next_pub) {
+                publish_dashboard();
+                next_pub += std::chrono::milliseconds(100);
+                if (next_pub < now) next_pub = now;  // don't replay missed ticks
+            }
+            if (now >= next_stat) {
                 print_stats();
                 next_stat += std::chrono::seconds(5);
             }
@@ -378,6 +461,46 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> engine_stop{false};
     std::atomic<bool> output_stop{false};
 
+    // ---- dashboard (optional) ----
+    DashboardHub hub;
+    DashboardHub* hub_ptr = nullptr;
+    std::function<uint64_t()> dash_clients_fn;
+#if ENGINE_HAS_DASHBOARD
+    std::unique_ptr<DashboardServer> dash_server;
+    if (cfg.dash_port != 0) {
+        hub.configure(cfg.live ? "live" : "synthetic",
+                      cfg.live ? cfg.product : "SYNTH");
+        // each broadcast tick: ask the engine for a fresh book (served
+        // within its next loop iteration, i.e. before the NEXT tick), then
+        // serialize what we have
+        dash_server = std::make_unique<DashboardServer>(
+            cfg.dash_port, [&hub] {
+                hub.request_book();
+                const auto now_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count());
+                return hub.snapshot_json(now_ms);
+            });
+        if (dash_server->start()) {
+            hub_ptr = &hub;
+            dash_clients_fn = [srv = dash_server.get()] {
+                return static_cast<uint64_t>(srv->client_count());
+            };
+            std::cout << "[init] dashboard: ws://localhost:" << cfg.dash_port
+                      << " (broadcasting at 10Hz)\n";
+        } else {
+            dash_server.reset();
+            std::cerr << "[init] WARNING: dashboard disabled (port busy?)\n";
+        }
+    }
+#else
+    if (cfg.dash_port != 0) {
+        std::cerr << "[init] WARNING: built without dashboard support "
+                     "(configure with -DBUILD_DASHBOARD=ON)\n";
+    }
+#endif
+
     // live feed object outlives the ingest thread so main can stop() it
     CoinbaseFeed feed{cfg.product};
 
@@ -398,7 +521,7 @@ int main(int argc, char* argv[]) {
             std::cout << "[init] engine thread: SCHED_FIFO acquired\n";
         }
         run_engine(input_queue, output_queue, latency_queue, counters,
-                   engine_stop);
+                   engine_stop, hub_ptr);
     });
 
     // ---- output thread (core 3): tape + stats ----
@@ -418,7 +541,7 @@ int main(int argc, char* argv[]) {
     std::thread output_thread([&] {
         pin_to_core(3);
         run_output(output_queue, latency_queue, counters, metrics, logger,
-                   output_stop, ingested_fn);
+                   output_stop, ingested_fn, hub_ptr, dash_clients_fn);
     });
 
     // ---- main thread: wait for signal or deadline ----
@@ -444,6 +567,12 @@ int main(int argc, char* argv[]) {
 
     output_stop.store(true, std::memory_order_release);
     output_thread.join();     // drains SPSC #2, prints final stats
+
+#if ENGINE_HAS_DASHBOARD
+    if (dash_server) {
+        dash_server->stop();  // after the threads: nothing reads the hub now
+    }
+#endif
 
     logger.close();  // flushes the stdio buffer
 

@@ -17,6 +17,7 @@ option(BUILD_TESTS      "Build unit tests (GoogleTest)"                 ON)
 option(BUILD_BENCHMARKS "Build micro-benchmarks (Google Benchmark)"     ON)
 option(BUILD_FEED       "Build live feed pipeline (Boost/simdjson/TLS)" OFF)
 option(BUILD_TOOLS      "Build synthetic generator / replay tools"      ON)
+option(BUILD_DASHBOARD  "Build dashboard WebSocket server (needs BUILD_FEED)" ON)
 
 # Warnings - attached per-target (not add_compile_options) so they apply to
 # OUR code only; FetchContent'd dependencies (GTest, Google Benchmark) build
@@ -118,10 +119,24 @@ if(BUILD_FEED)
     add_executable(feed-smoke tools/feed_smoke.cpp)
     target_link_libraries(feed-smoke PRIVATE engine_feed engine_warnings)
 
+    # Dashboard WebSocket server (Commit 13): plain-WS Beast broadcast of
+    # book/fills/latency JSON to the React dashboard. The hub header is
+    # dependency-free; only this server lib needs Boost
+    if(BUILD_DASHBOARD)
+        add_library(engine_server src/server/ws_server.cpp)
+        target_include_directories(engine_server PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_link_libraries(engine_server PRIVATE engine_warnings)
+        target_link_libraries(engine_server PUBLIC Boost::headers Threads::Threads)
+    endif()
+
     # Commit 10: the full pipeline (ingest -> engine -> output)
     add_executable(matching-engine src/main.cpp)
     # CMAKE_SOURCE_DIR so synthetic mode can include "tools/synthetic_workload.h"
     target_include_directories(matching-engine PRIVATE ${CMAKE_SOURCE_DIR})
+    if(BUILD_DASHBOARD)
+        target_compile_definitions(matching-engine PRIVATE ENGINE_HAS_DASHBOARD=1)
+        target_link_libraries(matching-engine PRIVATE engine_server)
+    endif()
     target_link_libraries(matching-engine PRIVATE
         engine_feed
         engine_metrics

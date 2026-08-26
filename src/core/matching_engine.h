@@ -56,7 +56,7 @@ private:
     // fill against resting orders at one price level until the incoming
     // order is satisfied or the level is empty; returns updated remaining
     Quantity fill_level(Price level_price, OrderId aggressive_id,
-                        Timestamp ts, Quantity remaining);
+                        Side aggressor_side, Timestamp ts, Quantity remaining);
 
     OrderBook                          book_;
     MemoryPool<Order, ORDER_POOL_SIZE> pool_;

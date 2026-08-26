@@ -34,6 +34,9 @@ struct FillMessage {
     Price     price         = 0;  // execution price in ticks
     Quantity  quantity      = 0;
     Timestamp timestamp     = 0;
+    // side of the TAKER: Bid = aggressive buy (uptick), Ask = aggressive
+    // sell. Appended last so positional aggregate inits stay valid
+    Side      aggressor_side = Side::Bid;
 };
 
 struct BookUpdateMessage {

@@ -122,6 +122,18 @@ cd build && ctest --output-on-failure
 ./build/matching-engine --live
 
 # options: --product ETH-USD | --duration N | --log FILE | --no-log
+#          --dashboard (WebSocket feed for the web UI on port 9100)
+```
+
+### Run the Dashboard
+```bash
+./build/matching-engine --live --dashboard   # terminal 1: engine + ws feed
+
+cd dashboard && npm install                  # terminal 2: web UI
+npm run dev                                  # -> http://localhost:5173
+
+# no engine handy? develop the UI against the simulator instead:
+npm run mock
 ```
 
 ## Project Structure

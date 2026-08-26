@@ -7,6 +7,10 @@ out/
 # vcpkg
 vcpkg_installed/
 
+# dashboard
+dashboard/node_modules/
+dashboard/dist/
+
 # Local toolchain (cmake/ninja binaries, not part of the project)
 .toolchain/
 

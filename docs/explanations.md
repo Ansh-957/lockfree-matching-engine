@@ -1550,3 +1550,106 @@ counters completed the story:
 ./build/order_book_bench --benchmark_min_time=1s
 ./build/ring_buffer_bench --benchmark_min_time=1s
 ```
+
+---
+
+## Commit 13 � Live Dashboard (`src/server/`, `dashboard/`)
+
+### What was added
+
+Tier 2 begins: a browser dashboard showing the running engine � order book
+ladder, trade tape, latency chart, throughput/pool stats � fed by a WebSocket
+server built into the engine binary. Two halves:
+
+- **C++**: `dashboard_hub.h` (thread-safe snapshot exchange, no dependencies)
+  and `ws_server.h/.cpp` (Boost.Beast plain-WS broadcast server, gated behind
+  `BUILD_DASHBOARD`, on by default with `BUILD_FEED`). Run with `--dashboard`.
+- **React** (`dashboard/`): Vite app, four components, zero UI-framework
+  dependencies � the entire look is one hand-written stylesheet.
+
+### The cardinal rule: the dashboard must not distort the measurements
+
+Everything in this commit is designed around not touching the hot path:
+
+- The engine thread checks one relaxed atomic bool per loop iteration
+  (`book_wanted_`). Only when the server raises it (10Hz) does the engine
+  walk the top 15 levels per side � and it uses **`try_lock`**: if the JSON
+  serializer happens to hold the hub lock at that instant, the engine skips
+  the frame instead of blocking. A dashboard frame is worth nothing; a
+  stalled matching loop is a corrupted p99.
+- The output thread batches fills and stats locally and publishes under one
+  lock per 100ms tick � never per fill.
+- The server serializes JSON **once** per tick into a shared immutable
+  string; every connected browser gets the same buffer. A slow client gets a
+  bounded per-session queue and is disconnected if it falls 6s behind,
+  so one stuck browser can't back-pressure the pipeline.
+
+### Schema and dedup design
+
+Frames are hand-rolled JSON (~3KB at 10Hz � a JSON library would be a
+dependency for nothing). Prices travel as integer ticks; the UI divides by
+100 at render time, keeping the wire format float-free like the engine.
+Fill rows carry a monotone `seq` id so the UI can union overlapping frames
+(the server always sends the last 48 fills; the browser appends only rows
+with `seq` greater than the last one seen).
+
+`FillMessage` gained an `aggressor_side` field (appended last so positional
+initializers stay valid) � the tape colors trades by taker direction, and
+only the engine knows it. Note: this changes the binary trade log record
+layout; old `trades.bin` files predate it.
+
+### UI decisions (`dashboard/`)
+
+The first version read as a generic dark SaaS dashboard (Inter, uppercase
+card titles, six identical metric tiles, a marketing footer). It was
+rewritten as a **matching desk / operator console** so a screenshot looks
+like a venue, not a template:
+
+- **Typography:** IBM Plex Sans + IBM Plex Mono. Inter is the default
+  "AI website" face; Plex is what a lot of actual finance/infra UIs use.
+  Every number is `tabular-nums` so columns don't wiggle as values tick.
+- **Color meaning, not decoration.** Near-black field, 1px hairlines, zero
+  radius, zero shadow, zero gradient. Amber is reserved for chrome (system
+  name, live tag, p99). Green/red exist only as bid/ask / buy/sell. If a
+  pixel is colored, it encodes a side or a warning.
+- **Quote strip before charts.** Traders read last / bid / ask / spread
+  first. Engine metrics (msg/s, match p50/p99) sit on the right of that
+  same strip so the market and the engine share one scan line. The six
+  "stat cards" went away; remaining counters live on a Bloomberg-style
+  status line at the bottom.
+- **Ladder:** asks above the spread, bids below (how a book is read).
+  Columns are price / size / cumulative / order count. Depth bars are
+  cumulative from the touch, scaled to the heavier side. Rows flash only
+  when that level's size actually changed (a ref of last qty) - flashing
+  on every 10Hz frame looked cheap and hid real updates.
+- **Tape:** B/S flag and a 2px side color on the left edge, newest first.
+- **Latency chart:** still a hand-rolled SVG on a **log y-axis** (ns→ms;
+  linear would flatten p50 into the baseline). Large p50/p95/p99 readouts
+  sit left of the plot like an instrument, not as chart-legend pills.
+- **Rates are client-side** from processed-count deltas, EMA-smoothed.
+- **Failure:** `NO ENGINE` banner, workspace dims while stale, reconnect
+  with capped backoff. Empty panes say `NO BOOK` / `NO PRINTS` in mono,
+  not "waiting for…" copy.
+
+### The mock server (`dashboard/mock-server.mjs`)
+
+A ~100-line Node script that speaks the exact hub schema with a plausible
+random-walk market (momentum bursts, bursty fills, occasional p99 spikes).
+It exists so the UI can be developed, demoed, and screen-recorded on any
+machine without building the C++ feed � and it doubles as the schema
+contract documentation.
+
+### How to run
+
+```bash
+# Linux, full build with dashboard server
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_FEED=ON \
+      -DCMAKE_TOOLCHAIN_FILE=~/vcpkg/scripts/buildsystems/vcpkg.cmake
+cmake --build build -j$(nproc)
+./build/matching-engine --live --dashboard        # or --synthetic --dashboard
+
+# any machine, UI dev against the simulator
+cd dashboard && npm install
+npm run mock     # terminal 1: fake engine on ws://localhost:9100
+npm run dev      # terminal 2: UI on http://localhost:5173
+```

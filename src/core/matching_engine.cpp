@@ -40,7 +40,7 @@ const std::vector<Fill>& MatchingEngine::process_new_order(const NewOrderMessage
             if (is_limit && level_price > msg.price) {
                 break;  // book no longer crosses our limit
             }
-            remaining = fill_level(level_price, msg.id, msg.timestamp, remaining);
+            remaining = fill_level(level_price, msg.id, msg.side, msg.timestamp, remaining);
         }
     } else {
         while (remaining > 0 && book_.has_bids()) {
@@ -48,7 +48,7 @@ const std::vector<Fill>& MatchingEngine::process_new_order(const NewOrderMessage
             if (is_limit && level_price < msg.price) {
                 break;
             }
-            remaining = fill_level(level_price, msg.id, msg.timestamp, remaining);
+            remaining = fill_level(level_price, msg.id, msg.side, msg.timestamp, remaining);
         }
     }
 
@@ -93,7 +93,8 @@ bool MatchingEngine::process_cancel(const CancelMessage& msg) {
 }
 
 Quantity MatchingEngine::fill_level(Price level_price, OrderId aggressive_id,
-                                    Timestamp ts, Quantity remaining) {
+                                    Side aggressor_side, Timestamp ts,
+                                    Quantity remaining) {
     PriceLevel& level = book_.get_level_mut(level_price);
 
     while (remaining > 0 && !level.empty()) {
@@ -109,7 +110,8 @@ Quantity MatchingEngine::fill_level(Price level_price, OrderId aggressive_id,
         remaining -= qty;
 
         // execution at the passive order's price
-        fills_.push_back({aggressive_id, passive->id, level_price, qty, ts});
+        fills_.push_back({aggressive_id, passive->id, level_price, qty, ts,
+                          aggressor_side});
 
         if (passive->is_filled()) {
             // unlinks (subtracting 0 remaining), erases from the id map,
