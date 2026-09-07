@@ -105,6 +105,8 @@ cmake --build build -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
+GitHub Actions (`.github/workflows/ci.yml`) builds Release, runs `ctest`, and executes a short SPSC benchmark smoke on every push/PR to `main`. The live feed binary is not part of CI (needs Boost/OpenSSL); the core engine and unit tests are.
+
 ### Run Benchmarks
 ```bash
 ./build/order_book_bench --benchmark_format=console

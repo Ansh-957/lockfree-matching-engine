@@ -25,7 +25,8 @@ dashboard/dist/
 .DS_Store
 Thumbs.db
 
-# Benchmark results (generated, not checked in — documented in docs/benchmarks.md)
+# Local study notes — not published with the repo
+docs/explanations.md
 results/*.json
 
 # Compiled

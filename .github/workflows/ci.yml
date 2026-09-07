@@ -1,0 +1,39 @@
+# C++20 verification pipeline for the matching engine core.
+#
+# BUILD_FEED stays OFF: the live Coinbase client needs Boost + OpenSSL and
+# is not required to prove the engine compiles and matches correctly.
+# There is no --self-test flag and no .clang-format in this repo, so CI
+# runs the real GoogleTest binary via ctest and a short Google Benchmark
+# smoke (not a latency gate — GitHub runners are noisy VMs).
+
+name: C++ CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke benchmark
+        run: >
+          ./build/ring_buffer_bench
+          --benchmark_filter=BM_SPSC_PushPop_SingleThread
+          --benchmark_min_time=0.1
